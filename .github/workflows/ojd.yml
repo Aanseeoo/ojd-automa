@@ -1,0 +1,26 @@
+name: OJD export daily
+
+on:
+  schedule:
+    # 10:10 UTC ≈ 12:10 Madrid en horario de verano. El script además comprueba >=12:05 Madrid.
+    - cron: "10 10 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          pip install playwright==1.46.0 pandas==2.2.2 gspread==6.1.2 google-auth==2.33.0 unidecode==1.3.8
+          python -m playwright install --with-deps chromium
+      - name: Run export
+        env:
+          OJD_USER: ${{ secrets.OJD_USER }}
+          OJD_PASS: ${{ secrets.OJD_PASS }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python ojd_export.py
