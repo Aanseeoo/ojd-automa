@@ -2,7 +2,11 @@ name: OJD export daily
 
 on:
   schedule:
-    - cron: "10 10 * * *"  # ~12:10 Madrid en verano
+    # Programa para las 12:15 hora de España:
+    # - Verano (CEST)  = 10:15 UTC
+    # - Invierno (CET) = 11:15 UTC
+    - cron: '15 10 * * *'
+    - cron: '15 11 * * *'
   workflow_dispatch: {}
 
 jobs:
@@ -20,6 +24,11 @@ jobs:
           pip install playwright==1.46.0 pandas==2.2.2 gspread==6.1.2 google-auth==2.33.0 unidecode==1.3.8
           python -m playwright install --with-deps chromium
 
+      - name: Prepare debug dir (always)
+        run: |
+          mkdir -p debug
+          echo "run $(date -u +%F_%T)Z" > debug/heartbeat.txt
+
       - name: Run export
         env:
           OJD_USER: ${{ secrets.OJD_USER }}
@@ -28,9 +37,8 @@ jobs:
         run: python ojd_export.py
 
       - name: Upload debug snapshots
-        if: always()   # sube capturas aunque falle el paso anterior
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-snapshots
           path: debug
-          if-no-files-found: ignore
