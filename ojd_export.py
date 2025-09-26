@@ -1,4 +1,4 @@
-import os, re, pathlib, sys
+import os, re, pathlib
 import pandas as pd
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -12,7 +12,7 @@ SHEET_TAB = os.getenv("SHEET_TAB", "OJD")
 LOGIN_URL = "https://www.ojdinteractiva.es/traffic-monitoring/login"
 TM_URL    = "https://www.ojdinteractiva.es/traffic-monitoring/traffic-monitoring/0/"
 
-OJD_USER = os.environ["OJD_USER"]   # Repository secrets
+OJD_USER = os.environ["OJD_USER"]
 OJD_PASS = os.environ["OJD_PASS"]
 
 # ================== GOOGLE SHEETS ==================
@@ -31,55 +31,52 @@ try:
 except gspread.exceptions.WorksheetNotFound:
     ws = sh.add_worksheet(title=SHEET_TAB, rows=2000, cols=10)
 
-# --- PING: escribe un sello en A1 para verificar permisos de edición ---
-try:
-    ws.update('A1', [[f'PING {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}']])
-    print("[PING] Escribí en A1 correctamente (permiso de edición OK).")
-except Exception as e:
-    print(f"[PING][ERROR] No pude escribir en la hoja: {e}")
-
 # ================== UTILIDADES ==================
 def tz_now(): return datetime.now(ZoneInfo("Europe/Madrid"))
 
 def day_target():
-    """
-    - Antes de 12:05 Madrid: usa hoy-3 (porque hoy-2 suele no estar aún).
-    - A partir de 12:05 Madrid: usa hoy-2.
-    """
+    # Antes de 12:05 -> hoy-3; a partir de 12:05 -> hoy-2
     now = tz_now()
-    if now.hour < 12 or (now.hour == 12 and now.minute < 5):
-        return now - timedelta(days=3)
-    return now - timedelta(days=2)
+    return (now - timedelta(days=3)) if (now.hour < 12 or (now.hour == 12 and now.minute < 5)) else (now - timedelta(days=2))
 
 def guard_1215():
-    """Solo ejecutar si ya son >= 12:15 Europe/Madrid (por si el cron dispara dos veces)."""
     nm = tz_now()
     if nm.hour < 12 or (nm.hour == 12 and nm.minute < 15):
-        print(f"[SKIP] Son {nm.strftime('%H:%M')} Europe/Madrid (< 12:15). No ejecuto.")
+        print(f"[SKIP] {nm.strftime('%H:%M')} Europe/Madrid (<12:15) -> no ejecuto.")
         return False
     return True
 
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", unidecode(str(s).lower()))
 
-ALIASES = {
-    "ultimahora.es": {"ultimahora.es","ultimahora","ultima hora","última hora"},
-    "diariodemallorca.es": {"diariodemallorca.es","diariodemallorca","diario de mallorca"},
-    "diariodeibiza.es": {"diariodeibiza.es","diariodeibiza","diario de ibiza"},
-    "mallorcamagazin.es": {"mallorcamagazin.es","mallorca magazin"},
-    "mallorcazeitung.es": {"mallorcazeitung.es","mallorca zeitung"},
-    "majorcadailybulletin.es": {"majorcadailybulletin.es","majorcadaily","majorca daily bulletin","majorca daily"},
+# Mapeo final de nombres (como quieres verlos en la hoja)
+TARGET_NAMES = {
+    "ultimahora": "ULTIMAHORA.ES",
+    "diariodemallorca": "DIARIODEMALLORCA.ES",
+    "diariodeibiza": "DIARIODEIBIZA.ES",
+    "mallorcamagazin": "MALLORCAMAGAZIN.COM",
+    "mallorcazeitung": "MALLORCAZEITUNG.ES",
+    "majorcadaily": "MAJORCADAILYBULLETIN.COM",
+    "majorcadailybulletin": "MAJORCADAILYBULLETIN.COM",
 }
-ORDER = list(ALIASES.keys())
+
+ALIASES = {
+    "ultimahora": {"ultimahora.es","ultimahora","ultima hora","última hora"},
+    "diariodemallorca": {"diariodemallorca.es","diariodemallorca","diario de mallorca"},
+    "diariodeibiza": {"diariodeibiza.es","diariodeibiza","diario de ibiza"},
+    "mallorcamagazin": {"mallorcamagazin.es","mallorca magazin","mallorcamagazin.com"},
+    "mallorcazeitung": {"mallorcazeitung.es","mallorca zeitung"},
+    "majorcadaily": {"majorcadailybulletin.es","majorcadaily","majorca daily bulletin","majorca daily","majorcadailybulletin.com"},
+}
+ORDER = list(TARGET_NAMES.keys())
 
 DEBUG_DIR = pathlib.Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
 def dbg(page, step):
-    png = DEBUG_DIR / f"{step}.png"
-    html = DEBUG_DIR / f"{step}.html"
-    try: page.screenshot(path=str(png), full_page=True)
-    except Exception as e: print(f"[DEBUG] screenshot {step} err: {e}")
-    try: html.write_text(page.content(), encoding="utf-8")
-    except Exception as e: print(f"[DEBUG] html {step} err: {e}")
+    try:
+        page.screenshot(path=str(DEBUG_DIR / f"{step}.png"), full_page=True)
+        (DEBUG_DIR / f"{step}.html").write_text(page.content(), encoding="utf-8")
+    except Exception as e:
+        print(f"[DEBUG] {step}: {e}")
 
 def pick_table(tables):
     signals = [
@@ -88,29 +85,28 @@ def pick_table(tables):
         {"paginasvistas","pageviews","paginas","pv"},
         {"nombre","medio","site","sitio","dominio","brand","marca","titulo","name"},
     ]
-    best, best_score = None, -1
+    best, score_best = None, -1
     for t in tables:
         cols = {norm(c) for c in t.columns}
         score = sum(any(any(s in col for col in cols) for s in group) for group in signals)
-        if score > best_score:
-            best, best_score = t, score
+        if score > score_best:
+            best, score_best = t, score
     return best
 
-def filter_keep(df: pd.DataFrame, media_col: str) -> pd.DataFrame:
-    def matches(val: str) -> bool:
-        n = norm(val)
-        for al in ALIASES.values():
-            if any(norm(a) in n for a in al): return True
-        return False
-    keep = df[df[media_col].astype(str).apply(matches)].copy()
-    def ord_key(v):
-        n = norm(str(v))
-        for i, dom in enumerate(ORDER):
-            if any(norm(a) in n for a in ALIASES[dom]): return i
-        return 999
-    keep["__ord"] = keep[media_col].apply(ord_key)
-    keep = keep.sort_values("__ord").drop(columns="__ord")
-    return keep
+def canonical_name(val: str) -> str | None:
+    n = norm(val)
+    for key, aliases in ALIASES.items():
+        if any(norm(a) in n for a in aliases):
+            return TARGET_NAMES[key]
+    return None
+
+def to_int(x):
+    # "232.762" -> 232762 ; "81,379" -> 81379 ; vacíos -> None
+    s = str(x).strip()
+    if s.lower() in {"", "nan", "none", "null"}:
+        return None
+    s = s.replace(".", "").replace(",", "")
+    return int(s) if s.isdigit() else None
 
 def shape_output(df: pd.DataFrame, media_col: str, forced_date: datetime) -> pd.DataFrame:
     def find_col(cands):
@@ -122,51 +118,79 @@ def shape_output(df: pd.DataFrame, media_col: str, forced_date: datetime) -> pd.
     navu_col   = find_col({"navegadoresunicos","usuariosunicos","usuarios","users"})
     visitas_col= find_col({"visitas","sesiones","sessions","visits"})
     pv_col     = find_col({"paginasvistas","pageviews","paginas","pv"})
+
     out = pd.DataFrame()
     out["Fecha"] = forced_date.strftime("%Y-%m-%d")
-    out["Nombre"] = df[media_col].astype(str)
-    out["Navegadores Únicos"] = df[navu_col] if navu_col in df else ""
-    out["Visitas"] = df[visitas_col] if visitas_col in df else ""
-    out["Páginas Vistas"] = df[pv_col] if pv_col in df else ""
+    out["Nombre"] = df[media_col].map(canonical_name)
+    out["Navegadores Únicos"] = df[navu_col].map(to_int) if navu_col in df else None
+    out["Visitas"] = df[visitas_col].map(to_int) if visitas_col in df else None
+    out["Páginas Vistas"] = df[pv_col].map(to_int) if pv_col in df else None
+
+    out = out.dropna(subset=["Nombre"]).reset_index(drop=True)
+    # Orden fijo
+    order_index = {TARGET_NAMES[k]: i for i,k in enumerate(ORDER)}
+    out["__ord"] = out["Nombre"].map(lambda x: order_index.get(x, 999))
+    out = out.sort_values("__ord").drop(columns="__ord")
     return out
 
-def write_overwrite(df: pd.DataFrame):
-    print(f"[WRITE] Filas a escribir (sin cabecera): {len(df)}")
-    ws.clear()
-    ws.update([df.columns.tolist()] + df.astype(str).values.tolist())
-    print("[WRITE] OK")
+def write_append_and_dedupe(df_new: pd.DataFrame):
+    # Lee lo que ya hay (si hay algo)
+    existing_vals = ws.get_all_values()
+    if not existing_vals:
+        ws.update([df_new.columns.tolist()] + df_new.astype(object).where(pd.notna(df_new), "").values.tolist())
+        print(f"[WRITE] Nueva hoja con {len(df_new)} filas.")
+        return
 
-# ================== PLAYWRIGHT FLOW ==================
+    header = existing_vals[0]
+    data = existing_vals[1:]
+    df_old = pd.DataFrame(data, columns=header)
+    # Normaliza tipos
+    if "Fecha" in df_old.columns:
+        # mantén texto tal cual
+        pass
+    for c in ["Navegadores Únicos","Visitas","Páginas Vistas"]:
+        if c in df_old.columns:
+            df_old[c] = pd.to_numeric(df_old[c].str.replace(".","",regex=False).str.replace(",","",regex=False), errors="coerce").astype("Int64")
+
+    # Concat + dedupe por (Fecha, Nombre)
+    combo = pd.concat([df_old, df_new], ignore_index=True)
+    combo = combo.drop_duplicates(subset=["Fecha","Nombre"], keep="last")
+    # Ordena por Fecha asc y orden fijo de Nombre
+    order_index = {TARGET_NAMES[k]: i for i,k in enumerate(ORDER)}
+    combo["__ord"] = combo["Nombre"].map(lambda x: order_index.get(x, 999))
+    combo = combo.sort_values(["Fecha","__ord"]).drop(columns="__ord")
+
+    ws.clear()
+    ws.update([combo.columns.tolist()] + combo.astype(object).where(pd.notna(combo), "").values.tolist())
+    print(f"[WRITE] Guardadas {len(combo)} filas (histórico).")
+
+# ================== PLAYWRIGHT ==================
 def login_tm(page):
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
     dbg(page, "01_login_page")
 
-    # Cerrar banner de cookies si aparece
+    # Cerrar cookies si tapa el botón
     for txt in ["ACEPTAR TODO","Aceptar todo","Aceptar cookies","RECHAZAR","Rechazar todo"]:
         try:
             btn = page.get_by_role("button", name=re.compile(txt, re.I))
             if btn.count():
-                btn.first.click()
-                break
+                btn.first.click(); break
         except: pass
 
-    # Login por placeholder (según tu captura: "Usuario" y "Contraseña")
     page.get_by_placeholder("Usuario").fill(OJD_USER)
     page.get_by_placeholder("Contraseña").fill(OJD_PASS)
     page.get_by_role("button", name=re.compile(r"Acceder", re.I)).click()
     page.wait_for_load_state("networkidle")
     dbg(page, "02_after_login")
 
-    # Comprobar que no seguimos en login
     if page.locator("h1:has-text('Inicio de sesión')").count():
         raise RuntimeError("No se pudo iniciar sesión: pantalla de login sigue visible.")
 
-def open_tm_and_set_day(page, target_date: datetime):
+def open_tm_and_search(page, target_date: datetime):
     page.goto(TM_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
     dbg(page, "03_tm_loaded")
 
-    # Fijar día (hoy-2 o hoy-3 según la hora)
     ymd = target_date.strftime("%Y-%m-%d")
     ddmmyyyy = target_date.strftime("%d/%m/%Y")
 
@@ -201,7 +225,6 @@ def open_tm_and_set_day(page, target_date: datetime):
     page.wait_for_load_state("networkidle")
     dbg(page, "04_after_set_day")
 
-    # Click en "Buscar"
     clicked = False
     for sel in [
         "button:has-text('Buscar')",
@@ -210,11 +233,8 @@ def open_tm_and_set_day(page, target_date: datetime):
         'text=/^\\s*Buscar\\s*$/i'
     ]:
         if page.locator(sel).first.count():
-            page.locator(sel).first.click()
-            clicked = True
-            break
+            page.locator(sel).first.click(); clicked = True; break
     if not clicked:
-        print("[WARN] No encontré botón 'Buscar'. Envío Enter.")
         page.keyboard.press("Enter")
 
     page.wait_for_load_state("networkidle")
@@ -237,8 +257,9 @@ def extract_table(page) -> pd.DataFrame:
 
 # ================== MAIN ==================
 def run():
-    print("[START] ojd_export.py arrancó")
+    print("[START] ojd_export.py")
 
+    # Guardia 12:15 España
     if not guard_1215():
         return
 
@@ -250,37 +271,34 @@ def run():
         # 1) Login
         login_tm(page)
 
-        # 2) Día objetivo y Buscar
+        # 2) Fijar fecha y buscar
         target = day_target()
         print(f"[INFO] Fecha objetivo: {target.strftime('%Y-%m-%d')}")
-        open_tm_and_set_day(page, target)
+        open_tm_and_search(page, target)
 
-        # 3) Extraer tabla
+        # 3) Tabla
         df = extract_table(page)
         dbg(page, "06_table_captured")
-        print(f"[INFO] Filas totales detectadas en tabla: {len(df)}")
+        print(f"[INFO] Filas en tabla: {len(df)}")
 
-        # 4) Detectar columna del medio
+        # 4) Columna de medio
         candidates = [c for c in df.columns if norm(c) in {"nombre","medio","site","sitio","dominio","brand","marca","titulo","name"}]
         media_col = candidates[0] if candidates else df.columns[0]
-        print(f"[INFO] Columna de medio detectada: {media_col}")
+        print(f"[INFO] Columna medio: {media_col}")
 
-        # 5) Filtrar dominios
-        df = filter_keep(df, media_col)
-        print(f"[INFO] Filas tras filtrar dominios: {len(df)}")
-
-        # 6) Formato final
+        # 5) Formato final (normaliza nombre y números)
         out = shape_output(df, media_col, forced_date=target)
-        if out.empty:
-            print("[WARN] No hubo coincidencias; escribiré solo cabeceras.")
-            out = pd.DataFrame(columns=["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"])
+        print(f"[INFO] Filas tras filtro de dominios: {len(out)}")
 
-        # 7) Escribir a Sheets
-        print(f"[WRITE] Voy a escribir {len(out)} filas (sin cabecera) en '{SHEET_TAB}' del Sheet {SHEET_ID}")
-        write_overwrite(out)
-        dbg(page, "07_done")
+        # 6) Escribir: APPEND + DEDUPE
+        if out.empty:
+            print("[WARN] No hubo coincidencias; no escribo.")
+        else:
+            write_append_and_dedupe(out)
+            dbg(page, "07_done")
 
         browser.close()
 
 if __name__ == "__main__":
     run()
+
