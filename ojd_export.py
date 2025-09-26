@@ -31,6 +31,13 @@ try:
 except gspread.exceptions.WorksheetNotFound:
     ws = sh.add_worksheet(title=SHEET_TAB, rows=2000, cols=10)
 
+# --- PING opcional: escribe un sello de tiempo en A1 para verificar que SÍ podemos escribir ---
+try:
+    ws.update('A1', [[f'PING {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}']])
+    print("[PING] Escribí en A1 correctamente (permiso de edición OK).")
+except Exception as e:
+    print(f"[PING][ERROR] No pude escribir en la hoja: {e}")
+
 # ================== UTILIDADES ==================
 def tz_now(): return datetime.now(ZoneInfo("Europe/Madrid"))
 def day_minus(n): return (tz_now() - timedelta(days=n))
