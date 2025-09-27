@@ -1,6 +1,6 @@
 import os, re, pathlib
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from unidecode import unidecode
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -19,6 +19,7 @@ OJD_PASS = os.environ["OJD_PASS"]
 import gspread
 from google.oauth2.service_account import Credentials
 from json import loads as json_loads
+from gspread_formatting import CellFormat, numberFormat, format_cell_range
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive"]
@@ -49,13 +50,13 @@ def guard_1215():
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", unidecode(str(s).lower()))
 
-# Mapeo final de nombres (como quieres verlos en la hoja)
+# 🔠 Nombres objetivo exactamente como te los piden:
 TARGET_NAMES = {
     "ultimahora": "ULTIMAHORA.ES",
     "diariodemallorca": "DIARIODEMALLORCA.ES",
     "diariodeibiza": "DIARIODEIBIZA.ES",
     "mallorcamagazin": "MALLORCAMAGAZIN.COM",
-    "mallorcazeitung": "MALLORCAZEITUNG.ES",
+    "mallorcazeitung": "MALLORCAZEITUNG.COM",   # <- .COM según tu especificación final
     "majorcadaily": "MAJORCADAILYBULLETIN.COM",
     "majorcadailybulletin": "MAJORCADAILYBULLETIN.COM",
 }
@@ -65,11 +66,16 @@ ALIASES = {
     "diariodemallorca": {"diariodemallorca.es","diariodemallorca","diario de mallorca"},
     "diariodeibiza": {"diariodeibiza.es","diariodeibiza","diario de ibiza"},
     "mallorcamagazin": {"mallorcamagazin.es","mallorca magazin","mallorcamagazin.com"},
-    "mallorcazeitung": {"mallorcazeitung.es","mallorca zeitung"},
+    "mallorcazeitung": {"mallorcazeitung.es","mallorca zeitung","mallorcazeitung.com"},
     "majorcadaily": {"majorcadailybulletin.es","majorcadaily","majorca daily bulletin","majorca daily","majorcadailybulletin.com"},
 }
-ORDER = list(TARGET_NAMES.keys())
 
+ORDER = ["ultimahora","diariodemallorca","diariodeibiza","mallorcamagazin","mallorcazeitung","majorcadaily"]
+
+# Semana en español (lunes=0)
+WEEKDAYS_ES = ["lunes","martes","miércoles","jueves","viernes","sábado","domingo"]
+
+# Debug
 DEBUG_DIR = pathlib.Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
 def dbg(page, step):
     try:
@@ -77,6 +83,10 @@ def dbg(page, step):
         (DEBUG_DIR / f"{step}.html").write_text(page.content(), encoding="utf-8")
     except Exception as e:
         print(f"[DEBUG] {step}: {e}")
+
+# Google Sheets usa "serial" (días desde 1899-12-30)
+def gs_date_serial(d: date) -> int:
+    return (d - date(1899, 12, 30)).days
 
 def pick_table(tables):
     signals = [
@@ -101,7 +111,6 @@ def canonical_name(val: str) -> str | None:
     return None
 
 def to_int(x):
-    # "232.762" -> 232762 ; "81,379" -> 81379 ; vacíos -> None
     s = str(x).strip()
     if s.lower() in {"", "nan", "none", "null"}:
         return None
@@ -127,44 +136,210 @@ def shape_output(df: pd.DataFrame, media_col: str, forced_date: datetime) -> pd.
     out["Páginas Vistas"] = df[pv_col].map(to_int) if pv_col in df else None
 
     out = out.dropna(subset=["Nombre"]).reset_index(drop=True)
+
     # Orden fijo
     order_index = {TARGET_NAMES[k]: i for i,k in enumerate(ORDER)}
     out["__ord"] = out["Nombre"].map(lambda x: order_index.get(x, 999))
     out = out.sort_values("__ord").drop(columns="__ord")
     return out
 
-def write_append_and_dedupe(df_new: pd.DataFrame):
-    # Lee lo que ya hay (si hay algo)
-    existing_vals = ws.get_all_values()
-    if not existing_vals:
-        ws.update([df_new.columns.tolist()] + df_new.astype(object).where(pd.notna(df_new), "").values.tolist())
-        print(f"[WRITE] Nueva hoja con {len(df_new)} filas.")
+# ================== ESCRITURA: OJD (histórico por medio) ==================
+def write_append_and_dedupe_types(df_new: pd.DataFrame):
+    """
+    Mantiene histórico en 'OJD' con tipos correctos (Fecha=serial, métricas=número)
+    """
+    # Leer existente
+    vals = ws.get_all_values()
+    if not vals:
+        header = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
+        data = df_new.astype(object).where(pd.notna(df_new), "").values.tolist()
+        _write_with_formats([[*header]] + _to_serials(data))
         return
 
-    header = existing_vals[0]
-    data = existing_vals[1:]
+    header = vals[0]
+    data = vals[1:]
     df_old = pd.DataFrame(data, columns=header)
-    # Normaliza tipos
+
+    # Tipos
     if "Fecha" in df_old.columns:
-        # mantén texto tal cual
+        # viene como texto visible, lo dejamos tal cual y volvemos a escribir serial más abajo
         pass
     for c in ["Navegadores Únicos","Visitas","Páginas Vistas"]:
         if c in df_old.columns:
             df_old[c] = pd.to_numeric(df_old[c].str.replace(".","",regex=False).str.replace(",","",regex=False), errors="coerce").astype("Int64")
 
-    # Concat + dedupe por (Fecha, Nombre)
+    # Concat y dedupe
     combo = pd.concat([df_old, df_new], ignore_index=True)
     combo = combo.drop_duplicates(subset=["Fecha","Nombre"], keep="last")
-    # Ordena por Fecha asc y orden fijo de Nombre
+    # Orden
     order_index = {TARGET_NAMES[k]: i for i,k in enumerate(ORDER)}
     combo["__ord"] = combo["Nombre"].map(lambda x: order_index.get(x, 999))
     combo = combo.sort_values(["Fecha","__ord"]).drop(columns="__ord")
 
-    ws.clear()
-    ws.update([combo.columns.tolist()] + combo.astype(object).where(pd.notna(combo), "").values.tolist())
-    print(f"[WRITE] Guardadas {len(combo)} filas (histórico).")
+    # Escribir con formatos
+    rows = combo.astype(object).where(pd.notna(combo), "").values.tolist()
+    _write_with_formats([[*combo.columns.tolist()]] + _to_serials(rows))
 
-# ================== PLAYWRIGHT ==================
+def _to_serials(rows):
+    """
+    Convierte Fecha textual 'YYYY-MM-DD' (col 0) a serial de Google (número).
+    """
+    out = []
+    for r in rows:
+        rr = list(r)
+        try:
+            dt = datetime.strptime(str(rr[0]), "%Y-%m-%d").date()
+            rr[0] = gs_date_serial(dt)
+        except Exception:
+            pass
+        # C/D/E a int si procede
+        for i in [2,3,4]:
+            try:
+                rr[i] = int(rr[i]) if rr[i] not in ("", None, "nan") else ""
+            except Exception:
+                pass
+        out.append(rr)
+    return out
+
+def _write_with_formats(values):
+    ws.clear()
+    ws.update(range_name=f"{SHEET_TAB}!A1", values=values)
+    fmt_date = CellFormat(numberFormat=numberFormat(type="DATE", pattern="yyyy-mm-dd"))
+    fmt_num  = CellFormat(numberFormat=numberFormat(type="NUMBER", pattern="#,##0"))
+    try:
+        format_cell_range(ws, "A2:A10000", fmt_date)  # Fecha
+        format_cell_range(ws, "C2:E10000", fmt_num)   # Métricas
+    except Exception as e:
+        print(f"[FORMAT][WARN] {e}")
+
+# ================== HOJAS DE PAREJAS (histórico por día) ==================
+PAIR_SHEETS = {
+    "UH-DM": ("ULTIMAHORA.ES","DIARIODEMALLORCA.ES"),
+    "UH-DI": ("ULTIMAHORA.ES","DIARIODEIBIZA.ES"),
+    "MM-MZ": ("MALLORCAMAGAZIN.COM","MALLORCAZEITUNG.COM"),
+}
+SINGLE_SHEET = {
+    "MDB": "MAJORCADAILYBULLETIN.COM"
+}
+
+def upsert_pair_sheet(sheet_name: str, mediaA: str, mediaB: str, out_df: pd.DataFrame, target: datetime):
+    """
+    Upsert en hoja de comparación:
+    Día | Nº | Fecha | Usuarios A | Usuarios B | Visitas A | Visitas B | Páginas A | Páginas B | PV/U A | PV/U B
+    """
+    try:
+        ws_pair = sh.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws_pair = sh.add_worksheet(title=sheet_name, rows=2000, cols=20)
+        header = ["Día","Nº","Fecha",
+                  f"Usuarios {mediaA.split('.')[0].split('-')[0].split()[0].split('/')[0]}",
+                  f"Usuarios {mediaB.split('.')[0].split('-')[0].split()[0].split('/')[0]}",
+                  f"Visitas {mediaA.split('.')[0]}", f"Visitas {mediaB.split('.')[0]}",
+                  f"Páginas {mediaA.split('.')[0]}", f"Páginas {mediaB.split('.')[0]}",
+                  "PV/U A","PV/U B"]
+        ws_pair.update("A1", [header])
+
+    # Extraer valores del día
+    def pick(media):
+        row = out_df[out_df["Nombre"]==media]
+        if row.empty:
+            return None,None,None
+        r = row.iloc[0]
+        u,v,p = r["Navegadores Únicos"], r["Visitas"], r["Páginas Vistas"]
+        return int(u) if pd.notna(u) else None, int(v) if pd.notna(v) else None, int(p) if pd.notna(p) else None
+
+    uA,vA,pA = pick(mediaA)
+    uB,vB,pB = pick(mediaB)
+
+    weekday = WEEKDAYS_ES[target.weekday()].capitalize()
+    daynum  = target.day
+    serial  = gs_date_serial(target.date())
+
+    pvuA = round(pA/uA, 2) if uA and pA else None
+    pvuB = round(pB/uB, 2) if uB and pB else None
+
+    newrow = [weekday, daynum, serial, uA, uB, vA, vB, pA, pB, pvuA, pvuB]
+
+    # Leer existente para dedupe por Fecha
+    vals = ws_pair.get_all_values()
+    header = vals[0] if vals else []
+    data = vals[1:] if len(vals) > 1 else []
+    df = pd.DataFrame(data, columns=header) if header else pd.DataFrame()
+
+    if not df.empty and "Fecha" in df.columns:
+        # Reemplazar si ya existe la fecha
+        serial_str = str(serial)
+        mask = df["Fecha"] == serial_str
+        if mask.any():
+            idx = mask.idxmax()
+            rng = f"A{int(idx)+2}:K{int(idx)+2}"
+            ws_pair.update(rng, [newrow])
+        else:
+            ws_pair.append_row(newrow, value_input_option="USER_ENTERED")
+    else:
+        ws_pair.append_row(newrow, value_input_option="USER_ENTERED")
+
+    # Formatos
+    fmt_date = CellFormat(numberFormat=numberFormat(type="DATE", pattern="yyyy-mm-dd"))
+    fmt_num  = CellFormat(numberFormat=numberFormat(type="NUMBER", pattern="#,##0"))
+    fmt_dec2 = CellFormat(numberFormat=numberFormat(type="NUMBER", pattern="#,##0.00"))
+    try:
+        format_cell_range(ws_pair, "C2:C10000", fmt_date)   # Fecha
+        format_cell_range(ws_pair, "D2:I10000", fmt_num)    # enteros
+        format_cell_range(ws_pair, "J2:K10000", fmt_dec2)   # PV/U
+    except Exception as e:
+        print(f"[FORMAT][WARN] {sheet_name}: {e}")
+
+def upsert_single_sheet(sheet_name: str, media: str, out_df: pd.DataFrame, target: datetime):
+    """
+    Hoja de un solo medio (MDB):
+    Día | Nº | Fecha | Usuarios | Páginas vistas
+    """
+    try:
+        ws_single = sh.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws_single = sh.add_worksheet(title=sheet_name, rows=2000, cols=10)
+        ws_single.update("A1", [["Día","Nº","Fecha","Usuarios","Páginas vistas"]])
+
+    row = out_df[out_df["Nombre"]==media]
+    if row.empty:
+        u,p = None, None
+    else:
+        r = row.iloc[0]
+        u = int(r["Navegadores Únicos"]) if pd.notna(r["Navegadores Únicos"]) else None
+        p = int(r["Páginas Vistas"]) if pd.notna(r["Páginas Vistas"]) else None
+
+    weekday = WEEKDAYS_ES[target.weekday()].capitalize()
+    daynum  = target.day
+    serial  = gs_date_serial(target.date())
+
+    newrow = [weekday, daynum, serial, u, p]
+
+    vals = ws_single.get_all_values()
+    header = vals[0] if vals else []
+    data = vals[1:] if len(vals) > 1 else []
+    df = pd.DataFrame(data, columns=header) if header else pd.DataFrame()
+
+    if not df.empty and "Fecha" in df.columns:
+        serial_str = str(serial)
+        mask = df["Fecha"] == serial_str
+        if mask.any():
+            idx = mask.idxmax()
+            ws_single.update(f"A{int(idx)+2}:E{int(idx)+2}", [newrow])
+        else:
+            ws_single.append_row(newrow, value_input_option="USER_ENTERED")
+    else:
+        ws_single.append_row(newrow, value_input_option="USER_ENTERED")
+
+    fmt_date = CellFormat(numberFormat=numberFormat(type="DATE", pattern="yyyy-mm-dd"))
+    fmt_num  = CellFormat(numberFormat=numberFormat(type="NUMBER", pattern="#,##0"))
+    try:
+        format_cell_range(ws_single, "C2:C10000", fmt_date)
+        format_cell_range(ws_single, "D2:E10000", fmt_num)
+    except Exception as e:
+        print(f"[FORMAT][WARN] {sheet_name}: {e}")
+
+# ================== PLAYWRIGHT (login + scraping) ==================
 def login_tm(page):
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
     dbg(page, "01_login_page")
@@ -259,7 +434,6 @@ def extract_table(page) -> pd.DataFrame:
 def run():
     print("[START] ojd_export.py")
 
-    # Guardia 12:15 España
     if not guard_1215():
         return
 
@@ -271,7 +445,7 @@ def run():
         # 1) Login
         login_tm(page)
 
-        # 2) Fijar fecha y buscar
+        # 2) Día objetivo y Buscar
         target = day_target()
         print(f"[INFO] Fecha objetivo: {target.strftime('%Y-%m-%d')}")
         open_tm_and_search(page, target)
@@ -286,19 +460,23 @@ def run():
         media_col = candidates[0] if candidates else df.columns[0]
         print(f"[INFO] Columna medio: {media_col}")
 
-        # 5) Formato final (normaliza nombre y números)
+        # 5) Formato final por medio (nombres y números normalizados)
         out = shape_output(df, media_col, forced_date=target)
         print(f"[INFO] Filas tras filtro de dominios: {len(out)}")
 
-        # 6) Escribir: APPEND + DEDUPE
-        if out.empty:
-            print("[WARN] No hubo coincidencias; no escribo.")
-        else:
-            write_append_and_dedupe(out)
-            dbg(page, "07_done")
+        # 6) Escribir histórico por medio en 'OJD'
+        write_append_and_dedupe_types(out)
 
+        # 7) Escribir/actualizar hojas de parejas (histórico día a día)
+        for sheet, (A, B) in PAIR_SHEETS.items():
+            upsert_pair_sheet(sheet, A, B, out, target)
+
+        # 8) Hoja de un medio (MDB)
+        for sheet, M in SINGLE_SHEET.items():
+            upsert_single_sheet(sheet, M, out, target)
+
+        dbg(page, "07_done")
         browser.close()
 
 if __name__ == "__main__":
     run()
-
