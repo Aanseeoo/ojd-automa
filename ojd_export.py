@@ -1,4 +1,4 @@
-import os, re, pathlib, time
+import os, re, pathlib, time, hashlib
 from json import loads as json_loads
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -14,7 +14,7 @@ SHEET_TAB = os.getenv("SHEET_TAB", "OJD")
 LOGIN_URL = "https://www.ojdinteractiva.es/traffic-monitoring/login"
 TM_URL    = "https://www.ojdinteractiva.es/traffic-monitoring/traffic-monitoring/0/"
 
-# Modo estricto: si la web no muestra exactamente hoy-2, no se escribe (se marca NO HAY DATOS)
+# Modo estricto: si la web no muestra exactamente hoy-2 + tabla nueva, no escribimos (NO HAY DATOS)
 STRICT_HOY2 = True
 
 OJD_USER = os.environ["OJD_USER"]
@@ -373,18 +373,28 @@ def read_effective_date_from_page(page, fallback: datetime) -> datetime:
     except: pass
     return fallback
 
+# ========================== HASH DE TABLA ==========================
+def table_fingerprint(page) -> str:
+    try:
+        if not page.locator("table").count(): return ""
+        html = page.locator("table").first.inner_html()
+        return hashlib.md5(html.encode("utf-8", errors="ignore")).hexdigest()
+    except:
+        return ""
+
 # ========================== ABRIR, CLICAR DÍA, BUSCAR, ESPERAR ==========================
-def open_tm_and_search_force_exact(page, target_date: datetime, max_wait_s: int = 30, retries: int = 3) -> bool:
+def open_tm_and_search_force_exact(page, target_date: datetime, max_wait_s: int = 30, retries: int = 4) -> bool:
     """
     CLIC real en el datepicker para hoy-2, pulsar Buscar y
-    ESPERAR a que la banda azul muestre exactamente hoy-2.
+    ESPERAR a que:
+      1) la banda azul muestre hoy-2 y
+      2) la TABLA cambie de contenido (fingerprint distinto).
     Devuelve True si lo consigue; False si no.
     """
     page.goto(TM_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
     dbg(page, "03_tm_loaded")
 
-    # localizar el input asociado a 'Día'
     dia_input = page.locator("input").first
     try:
         lab = page.locator("label:has-text('Día')").first
@@ -405,6 +415,8 @@ def open_tm_and_search_force_exact(page, target_date: datetime, max_wait_s: int 
         return None
 
     for attempt in range(retries):
+        before_fp = table_fingerprint(page)
+
         # abrir calendario
         dia_input.click(force=True)
         page.wait_for_timeout(200)
@@ -427,7 +439,6 @@ def open_tm_and_search_force_exact(page, target_date: datetime, max_wait_s: int 
         if day_cell.count():
             day_cell.click()
         else:
-            # fallback: escribir dd/mm/yyyy + Enter
             dia_input.fill(target_date.strftime("%d/%m/%Y"))
             dia_input.press("Enter")
 
@@ -442,35 +453,33 @@ def open_tm_and_search_force_exact(page, target_date: datetime, max_wait_s: int 
         if not clicked:
             dia_input.press("Enter")
 
-        # esperar a que la banda muestre exactamente hoy-2
+        # esperar: fecha correcta Y tabla distinta
         t0 = time.time()
         while time.time() - t0 < max_wait_s:
             eff = read_effective_date_from_page(page, target_date)
-            if eff.date() == target_date.date():
+            after_fp = table_fingerprint(page)
+            if eff.date() == target_date.date() and after_fp and after_fp != before_fp:
                 dbg(page, f"05_after_search_ok_attempt{attempt+1}")
                 return True
             page.wait_for_timeout(500)
 
-        # si no coincidió, pequeño ajuste por JS y reintento
-        page.evaluate("""(iso, dmy) => {
-            const dt = document.querySelector('input[type="date"]');
-            if (dt) {
-              dt.value = iso;
-              dt.dispatchEvent(new Event('input',{bubbles:true}));
-              dt.dispatchEvent(new Event('change',{bubbles:true}));
-            }
-            const lab = Array.from(document.querySelectorAll('label'))
-              .find(l => /d[ií]a/i.test(l.textContent||''));
-            if (lab) {
-              const input = lab.parentElement.querySelector('input');
-              if (input) {
-                input.value = dmy;
-                input.dispatchEvent(new Event('input',{bubbles:true}));
-                input.dispatchEvent(new Event('change',{bubbles:true}));
-              }
-            }
-        }""", target_date.strftime("%Y-%m-%d"), target_date.strftime("%d/%m/%Y"))
-        page.wait_for_timeout(200)
+        # si no cambió la tabla pero la fecha sí, intenta un 2º "Buscar"
+        eff = read_effective_date_from_page(page, target_date)
+        if eff.date() == target_date.date():
+            for sel in ["button:has-text('Buscar')",
+                        "input[type='submit'][value*='Buscar']",
+                        "button[title*='Buscar']",
+                        'text=/^\\s*Buscar\\s*$/i']:
+                if page.locator(sel).first.count():
+                    page.locator(sel).first.click()
+                    break
+            t1 = time.time()
+            while time.time() - t1 < 10:
+                after_fp = table_fingerprint(page)
+                if after_fp and after_fp != before_fp:
+                    dbg(page, f"05_after_search_ok_attempt{attempt+1}_second")
+                    return True
+                page.wait_for_timeout(400)
 
     dbg(page, "05_after_search_fail")
     return False
@@ -505,16 +514,16 @@ def run():
         target = day_target()
         print(f"[INFO] Objetivo (hoy-2): {target:%Y-%m-%d}")
 
-        ok = open_tm_and_search_force_exact(page, target, max_wait_s=30, retries=4)
+        ok = open_tm_and_search_force_exact(page, target, max_wait_s=40, retries=5)
 
         if not ok:
-            print(f"[WARN] La web NO mostró {target:%Y-%m-%d} tras reintentos.")
+            print(f"[WARN] La web NO mostró {target:%Y-%m-%d} con tabla recargada.")
             if STRICT_HOY2:
                 write_no_data(target)
                 dbg(page, "07_done_no_data")
                 browser.close()
                 return
-            # modo laxo: usar la efectiva (desaconsejado para tu caso)
+            # modo laxo (no recomendado para tu caso):
             # target = read_effective_date_from_page(page, target)
 
         try:
@@ -558,3 +567,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
