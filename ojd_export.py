@@ -8,8 +8,8 @@ from unidecode import unidecode
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ========================== CONFIGURACIÓN ==========================
-SHEET_ID  = "1ra1VSpOZ6JuMp-S_MsqNbHEGr2n0VA702lbFsVBD-Os"
-SHEET_TAB = os.getenv("SHEET_TAB", "OJD")
+SHEET_ID  = "1ra1VSpOZ6JuMp-S_MsqNbHEGr2n0VA702lbFsVBD-Os"     # BASE
+SHEET_TAB = os.getenv("SHEET_TAB", "OJD")                      # pestaña base
 
 LOGIN_URL = "https://www.ojdinteractiva.es/traffic-monitoring/login"
 TM_URL    = "https://www.ojdinteractiva.es/traffic-monitoring/traffic-monitoring/0/"
@@ -38,27 +38,24 @@ def tz_now() -> datetime:
     return datetime.now(ZoneInfo("Europe/Madrid"))
 
 def day_target() -> datetime:
-    # Antes de 12:05 -> hoy-3 (evitamos día aún vacío). A partir 12:05 -> hoy-2.
+    # Siempre hoy-2 (como pediste)
     now = tz_now()
-    return (now - timedelta(days=3)) if (now.hour < 12 or (now.hour == 12 and now.minute < 5)) else (now - timedelta(days=2))
+    return now - timedelta(days=2)
 
 def guard_1215() -> bool:
-    nm = tz_now()
-    if nm.hour < 12 or (nm.hour == 12 and nm.minute < 15):
-        print(f"[SKIP] {nm.strftime('%H:%M')} Europe/Madrid (<12:15) -> no ejecuto.")
-        return False
+    # Sin bloqueo horario
     return True
 
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", unidecode(str(s).lower()))
 
-# Nombres oficiales que nos pides en salida
+# Nombres oficiales en salida (según tu entregable)
 TARGET_NAMES = {
     "ultimahora":       "ULTIMAHORA.ES",
     "diariodemallorca": "DIARIODEMALLORCA.ES",
     "diariodeibiza":    "DIARIODEIBIZA.ES",
     "mallorcamagazin":  "MALLORCAMAGAZIN.COM",
-    "mallorcazeitung":  "MALLORCAZEITUNG.COM",   # .COM (tu requerimiento)
+    "mallorcazeitung":  "MALLORCAZEITUNG.COM",   # .COM
     "majorcadaily":     "MAJORCADAILYBULLETIN.COM",
     "majorcadailybulletin": "MAJORCADAILYBULLETIN.COM",
 }
@@ -69,7 +66,8 @@ ALIASES = {
     "diariodeibiza": {"diariodeibiza.es","diariodeibiza","diario de ibiza"},
     "mallorcamagazin": {"mallorcamagazin.es","mallorca magazin","mallorcamagazin.com"},
     "mallorcazeitung": {"mallorcazeitung.es","mallorca zeitung","mallorcazeitung.com"},
-    "majorcadaily": {"majorcadailybulletin.es","majorcadaily","majorca daily bulletin","majorca daily","majorcadailybulletin.com"},
+    "majorcadaily": {"majorcadailybulletin.es","majorcadaily","majorca daily bulletin",
+                     "majorca daily","majorcadailybulletin.com"},
 }
 ORDER_KEYS = ["ultimahora","diariodemallorca","diariodeibiza","mallorcamagazin","mallorcazeitung","majorcadaily"]
 
@@ -88,7 +86,7 @@ def gs_date_serial(d: date) -> int:
     return (d - date(1899, 12, 30)).days
 
 def pick_table(tables):
-    # elige la tabla que tenga columnas relevantes
+    # Elige la tabla que tenga columnas relevantes
     signals = [
         {"navegadoresunicos","usuariosunicos","usuarios","users","navegadores"},
         {"visitas","sesiones","sessions","visits"},
@@ -161,7 +159,7 @@ def _to_serial_rows(rows):
 
 def _write_ws_with_formats(target_ws, values):
     target_ws.clear()
-    # MUY IMPORTANTE: usamos rango simple "A1" (no "Hoja!A1") para evitar el bug OJD!OJD!A1
+    # MUY IMPORTANTE: rango simple "A1" (evita 'OJD!OJD!A1')
     target_ws.update("A1", values)
     fmt_date = CellFormat(numberFormat=numberFormat(type="DATE", pattern="yyyy-mm-dd"))
     fmt_num  = CellFormat(numberFormat=numberFormat(type="NUMBER", pattern="#,##0"))
@@ -198,7 +196,7 @@ def write_append_and_dedupe_types(df_new: pd.DataFrame):
     rows = combo.astype(object).where(pd.notna(combo), "").values.tolist()
     _write_ws_with_formats(ws, [header] + _to_serial_rows(rows))
 
-# ========================== HOJAS DE PAREJAS ==========================
+# ========================== HOJAS DE PAREJAS / SINGLE ==========================
 PAIR_SHEETS = {
     "UH-DM": ("ULTIMAHORA.ES","DIARIODEMALLORCA.ES"),
     "UH-DI": ("ULTIMAHORA.ES","DIARIODEIBIZA.ES"),
@@ -301,6 +299,36 @@ def upsert_single_sheet(sheet_name: str, media: str, out_df: pd.DataFrame, targe
     except Exception as e:
         print(f"[FORMAT][WARN] {sheet_name}: {e}")
 
+# ========================== FALLBACK: NO HAY DATOS ==========================
+def write_no_data(target_dt: datetime):
+    # Marca en OJD y añade filas "vacías" en comparativas
+    row = [[target_dt.strftime("%Y-%m-%d"), "NO HAY DATOS", "", "", ""]]
+    vals = ws.get_all_values()
+    header = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
+    if not vals:
+        ws.update("A1", [header] + row)
+    else:
+        df_old = pd.DataFrame(vals[1:], columns=vals[0])
+        if not ((df_old["Fecha"] == row[0][0]) & (df_old["Nombre"] == "NO HAY DATOS")).any():
+            ws.append_row(row[0], value_input_option="USER_ENTERED")
+
+    weekday = WEEKDAYS_ES[target_dt.weekday()].capitalize()
+    daynum  = target_dt.day
+    serial  = gs_date_serial(target_dt.date())
+    for sheet in PAIR_SHEETS.keys():
+        try:
+            ws_pair = sh.worksheet(sheet)
+            ws_pair.append_row([weekday, daynum, serial, None, None, None, None, None, None, None, None],
+                               value_input_option="USER_ENTERED")
+        except gspread.exceptions.WorksheetNotFound:
+            pass
+    for sheet in SINGLE_SHEET.keys():
+        try:
+            ws_single = sh.worksheet(sheet)
+            ws_single.append_row([weekday, daynum, serial, None, None], value_input_option="USER_ENTERED")
+        except gspread.exceptions.WorksheetNotFound:
+            pass
+
 # ========================== PLAYWRIGHT (login + buscar) ==========================
 def login_tm(page):
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
@@ -378,6 +406,25 @@ def open_tm_and_search(page, target_date: datetime):
     page.wait_for_load_state("networkidle")
     dbg(page, "05_after_search")
 
+def read_effective_date_from_page(page, fallback: datetime) -> datetime:
+    # 1) valor del input[type=date]
+    try:
+        v = page.eval_on_selector('input[type="date"]', "e => e && e.value")
+        if v:  # 'YYYY-MM-DD'
+            return datetime.strptime(v, "%Y-%m-%d")
+    except:
+        pass
+    # 2) cualquier 'dd/mm/yyyy' en el texto
+    try:
+        txt = page.text_content("body") or ""
+        m = re.search(r"\b(\d{2})/(\d{2})/(\d{4})\b", txt)
+        if m:
+            d, mth, y = map(int, m.groups())
+            return datetime(y, mth, d)
+    except:
+        pass
+    return fallback
+
 def extract_table(page) -> pd.DataFrame:
     try:
         page.wait_for_selector("table", timeout=30000)
@@ -402,25 +449,50 @@ def run():
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
+        # Login
         login_tm(page)
 
+        # Fecha solicitada
         target = day_target()
-        print(f"[INFO] Fecha objetivo: {target.strftime('%Y-%m-%d')}")
+        print(f"[INFO] Fecha solicitada (hoy-2): {target.strftime('%Y-%m-%d')}")
         open_tm_and_search(page, target)
 
-        df = extract_table(page)
+        # Fecha efectiva que muestra la web
+        effective = read_effective_date_from_page(page, target)
+        if effective.date() != target.date():
+            print(f"[WARN] La web muestra {effective.strftime('%Y-%m-%d')} (no {target.strftime('%Y-%m-%d')}). Usaremos la fecha efectiva.")
+            target = effective
+
+        # Tabla
+        try:
+            df = extract_table(page)
+        except Exception as e:
+            print(f"[INFO] No hay tabla/datos: {e}")
+            write_no_data(target)
+            dbg(page, "07_done_no_data")
+            browser.close()
+            return
+
         dbg(page, "06_table")
         print(f"[INFO] Filas en tabla: {len(df)}")
 
-        # detectamos columna del medio
+        # Columna del medio
         candidates = [c for c in df.columns if norm(c) in {
             "nombre","medio","site","sitio","dominio","brand","marca","titulo","name"
         }]
         media_col = candidates[0] if candidates else df.columns[0]
         print(f"[INFO] Columna medio: {media_col}")
 
+        # Output normalizado
         out = shape_output(df, media_col, forced_date=target)
         print(f"[INFO] Filas tras filtro dominios: {len(out)}")
+
+        if out.empty:
+            print("[INFO] No hay datos para esa fecha. Escribimos marcador.")
+            write_no_data(target)
+            dbg(page, "07_done_no_data")
+            browser.close()
+            return
 
         # 1) OJD (histórico por medio)
         write_append_and_dedupe_types(out)
