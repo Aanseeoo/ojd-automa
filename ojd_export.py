@@ -7,12 +7,15 @@ import pandas as pd
 from unidecode import unidecode
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# ========================== CONFIGURACIÓN ==========================
-SHEET_ID  = "1ra1VSpOZ6JuMp-S_MsqNbHEGr2n0VA702lbFsVBD-Os"     # BASE
-SHEET_TAB = os.getenv("SHEET_TAB", "OJD")                      # pestaña base
+# ========================== CONFIG ==========================
+SHEET_ID  = "1ra1VSpOZ6JuMp-S_MsqNbHEGr2n0VA702lbFsVBD-Os"  # Base
+SHEET_TAB = os.getenv("SHEET_TAB", "OJD")
 
 LOGIN_URL = "https://www.ojdinteractiva.es/traffic-monitoring/login"
 TM_URL    = "https://www.ojdinteractiva.es/traffic-monitoring/traffic-monitoring/0/"
+
+# Modo estricto: si la web no muestra exactamente hoy-2, no se escribe (se marca NO HAY DATOS)
+STRICT_HOY2 = True
 
 OJD_USER = os.environ["OJD_USER"]
 OJD_PASS = os.environ["OJD_PASS"]
@@ -33,33 +36,41 @@ try:
 except gspread.exceptions.WorksheetNotFound:
     ws = sh.add_worksheet(title=SHEET_TAB, rows=2000, cols=10)
 
-# ========================== UTILIDADES ==========================
+# ========================== UTILS ==========================
+DEBUG_DIR = pathlib.Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
+def dbg(page, step):
+    try:
+        page.screenshot(path=str(DEBUG_DIR / f"{step}.png"), full_page=True)
+        (DEBUG_DIR / f"{step}.html").write_text(page.content(), encoding="utf-8")
+    except Exception as e:
+        print(f"[DEBUG] {step}: {e}")
+
 def tz_now() -> datetime:
     return datetime.now(ZoneInfo("Europe/Madrid"))
 
 def day_target() -> datetime:
-    # Siempre hoy-2 (como pediste)
-    now = tz_now()
-    return now - timedelta(days=2)
+    return tz_now() - timedelta(days=2)  # hoy-2
 
 def guard_1215() -> bool:
-    # Sin bloqueo horario (el YAML decide cuándo correr)
-    return True
+    return True  # el YAML decide la hora
 
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", unidecode(str(s).lower()))
 
-# Nombres oficiales en salida (según tu entregable)
+WEEKDAYS_ES = ["lunes","martes","miércoles","jueves","viernes","sábado","domingo"]
+
+def gs_date_serial(d: date) -> int:
+    return (d - date(1899, 12, 30)).days
+
 TARGET_NAMES = {
     "ultimahora":       "ULTIMAHORA.ES",
     "diariodemallorca": "DIARIODEMALLORCA.ES",
     "diariodeibiza":    "DIARIODEIBIZA.ES",
     "mallorcamagazin":  "MALLORCAMAGAZIN.COM",
-    "mallorcazeitung":  "MALLORCAZEITUNG.COM",   # .COM
+    "mallorcazeitung":  "MALLORCAZEITUNG.COM",
     "majorcadaily":     "MAJORCADAILYBULLETIN.COM",
     "majorcadailybulletin": "MAJORCADAILYBULLETIN.COM",
 }
-
 ALIASES = {
     "ultimahora": {"ultimahora.es","ultimahora","ultima hora","última hora"},
     "diariodemallorca": {"diariodemallorca.es","diariodemallorca","diario de mallorca"},
@@ -69,37 +80,8 @@ ALIASES = {
     "majorcadaily": {"majorcadailybulletin.es","majorcadaily","majorca daily bulletin",
                      "majorca daily","majorcadailybulletin.com"},
 }
-ORDER_KEYS = ["ultimahora","diariodemallorca","diariodeibiza","mallorcamagazin","mallorcazeitung","majorcadaily"]
-
-WEEKDAYS_ES = ["lunes","martes","miércoles","jueves","viernes","sábado","domingo"]
-
-DEBUG_DIR = pathlib.Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
-def dbg(page, step):
-    try:
-        page.screenshot(path=str(DEBUG_DIR / f"{step}.png"), full_page=True)
-        (DEBUG_DIR / f"{step}.html").write_text(page.content(), encoding="utf-8")
-    except Exception as e:
-        print(f"[DEBUG] {step}: {e}")
-
-# Google Sheets almacena fechas como "serial" (días desde 1899-12-30)
-def gs_date_serial(d: date) -> int:
-    return (d - date(1899, 12, 30)).days
-
-def pick_table(tables):
-    # Elige la tabla que tenga columnas relevantes
-    signals = [
-        {"navegadoresunicos","usuariosunicos","usuarios","users","navegadores"},
-        {"visitas","sesiones","sessions","visits"},
-        {"paginasvistas","pageviews","paginas","pv"},
-        {"nombre","medio","site","sitio","dominio","brand","marca","titulo","name"},
-    ]
-    best, score_best = None, -1
-    for t in tables:
-        cols = {norm(c) for c in t.columns}
-        score = sum(any(any(s in col for col in cols) for s in group) for group in signals)
-        if score > score_best:
-            best, score_best = t, score
-    return best
+ORDER_KEYS = ["ultimahora","diariodemallorca","diariodeibiza",
+              "mallorcamagazin","mallorcazeitung","majorcadaily"]
 
 def canonical_name(val: str) -> str | None:
     n = norm(val)
@@ -115,12 +97,26 @@ def to_int(x):
     s = s.replace(".", "").replace(",", "")
     return int(s) if s.isdigit() else None
 
+def pick_table(tables):
+    signals = [
+        {"navegadoresunicos","usuariosunicos","usuarios","users","navegadores"},
+        {"visitas","sesiones","sessions","visits"},
+        {"paginasvistas","pageviews","paginas","pv"},
+        {"nombre","medio","site","sitio","dominio","brand","marca","titulo","name"},
+    ]
+    best, score_best = None, -1
+    for t in tables:
+        cols = {norm(c) for c in t.columns}
+        score = sum(any(any(s in col for col in cols) for s in group) for group in signals)
+        if score > score_best:
+            best, score_best = t, score
+    return best
+
 def shape_output(df: pd.DataFrame, media_col: str, forced_date: datetime) -> pd.DataFrame:
     def find_col(cands):
         for c in df.columns:
             nc = norm(c)
-            if any(nc == x or x in nc for x in cands):
-                return c
+            if any(nc == x or x in nc for x in cands): return c
         return None
     navu_col    = find_col({"navegadoresunicos","usuariosunicos","usuarios","users"})
     visitas_col = find_col({"visitas","sesiones","sessions","visits"})
@@ -139,7 +135,7 @@ def shape_output(df: pd.DataFrame, media_col: str, forced_date: datetime) -> pd.
     out = out.sort_values("__ord").drop(columns="__ord")
     return out
 
-# ========================== ESCRITURA OJD (histórico) ==========================
+# ========================== FORMATO/ESCRITURA ==========================
 def _to_serial_rows(rows):
     out = []
     for r in rows:
@@ -159,7 +155,6 @@ def _to_serial_rows(rows):
 
 def _write_ws_with_formats(target_ws, values):
     target_ws.clear()
-    # IMPORTANTE: rango simple "A1" (evita 'OJD!OJD!A1')
     target_ws.update("A1", values)
     fmt_date = CellFormat(numberFormat=numberFormat(type="DATE", pattern="yyyy-mm-dd"))
     fmt_num  = CellFormat(numberFormat=numberFormat(type="NUMBER", pattern="#,##0"))
@@ -196,15 +191,13 @@ def write_append_and_dedupe_types(df_new: pd.DataFrame):
     rows = combo.astype(object).where(pd.notna(combo), "").values.tolist()
     _write_ws_with_formats(ws, [header] + _to_serial_rows(rows))
 
-# ========================== HOJAS DE PAREJAS / SINGLE ==========================
+# ========================== Hojas comparativas ==========================
 PAIR_SHEETS = {
     "UH-DM": ("ULTIMAHORA.ES","DIARIODEMALLORCA.ES"),
     "UH-DI": ("ULTIMAHORA.ES","DIARIODEIBIZA.ES"),
     "MM-MZ": ("MALLORCAMAGAZIN.COM","MALLORCAZEITUNG.COM"),
 }
-SINGLE_SHEET = {
-    "MDB": "MAJORCADAILYBULLETIN.COM"
-}
+SINGLE_SHEET = { "MDB": "MAJORCADAILYBULLETIN.COM" }
 
 def upsert_pair_sheet(sheet_name: str, mediaA: str, mediaB: str, out_df: pd.DataFrame, target: datetime):
     try:
@@ -299,9 +292,8 @@ def upsert_single_sheet(sheet_name: str, media: str, out_df: pd.DataFrame, targe
     except Exception as e:
         print(f"[FORMAT][WARN] {sheet_name}: {e}")
 
-# ========================== FALLBACK: NO HAY DATOS ==========================
+# ========================== NO HAY DATOS ==========================
 def write_no_data(target_dt: datetime):
-    # Marca en OJD y añade filas "vacías" en comparativas
     row = [[target_dt.strftime("%Y-%m-%d"), "NO HAY DATOS", "", "", ""]]
     vals = ws.get_all_values()
     header = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
@@ -329,115 +321,161 @@ def write_no_data(target_dt: datetime):
         except gspread.exceptions.WorksheetNotFound:
             pass
 
-# ========================== PLAYWRIGHT (login + buscar) ==========================
+# ========================== LOGIN ==========================
 def login_tm(page):
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
     dbg(page, "01_login")
-
-    # cookies (si aparece)
     for txt in ["ACEPTAR TODO","Aceptar todo","Aceptar cookies","RECHAZAR","Rechazar todo"]:
         try:
             btn = page.get_by_role("button", name=re.compile(txt, re.I))
             if btn.count(): btn.first.click(); break
         except: pass
-
     page.get_by_placeholder("Usuario").fill(OJD_USER)
     page.get_by_placeholder("Contraseña").fill(OJD_PASS)
     page.get_by_role("button", name=re.compile(r"Acceder", re.I)).click()
     page.wait_for_load_state("networkidle")
     dbg(page, "02_after_login")
-
     if page.locator("h1:has-text('Inicio de sesión')").count():
-        raise RuntimeError("Login fallido (pantalla de login sigue visible).")
+        raise RuntimeError("Login fallido.")
+
+# ========================== FECHA EFECTIVA (BANDA AZUL) ==========================
+MES_ES = {
+    "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
+    "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
+}
+
+def parse_spanish_banner(text: str) -> datetime | None:
+    t = text.lower()
+    m = re.search(r"d[ií]a\s+(\d{1,2}).{0,3}([a-záéíóú]+).{0,3}(\d{4})", t)
+    if not m: return None
+    d, mes_txt, y = m.groups()
+    mes = MES_ES.get(mes_txt.strip(" ."), None)
+    if not mes: return None
+    return datetime(int(y), mes, int(d))
 
 def read_effective_date_from_page(page, fallback: datetime) -> datetime:
-    # 1) valor del input[type=date]
+    try:
+        txt = page.text_content("text=/Los datos.*D[ií]a/i") or ""
+        if txt:
+            dt = parse_spanish_banner(txt)
+            if dt: return dt
+    except: pass
     try:
         v = page.eval_on_selector('input[type="date"]', "e => e && e.value")
-        if v:  # 'YYYY-MM-DD'
-            return datetime.strptime(v, "%Y-%m-%d")
-    except:
-        pass
-    # 2) cualquier 'dd/mm/yyyy' en el texto
+        if v: return datetime.strptime(v, "%Y-%m-%d")
+    except: pass
     try:
         txt = page.text_content("body") or ""
         m = re.search(r"\b(\d{2})/(\d{2})/(\d{4})\b", txt)
         if m:
             d, mth, y = map(int, m.groups())
             return datetime(y, mth, d)
-    except:
-        pass
+    except: pass
     return fallback
 
-def open_tm_and_search_and_wait(page, target_date: datetime, max_wait_s: int = 30) -> datetime:
+# ========================== ABRIR, CLICAR DÍA, BUSCAR, ESPERAR ==========================
+def open_tm_and_search_force_exact(page, target_date: datetime, max_wait_s: int = 30, retries: int = 3) -> bool:
     """
-    Selecciona fecha, pulsa Buscar y espera hasta que la fecha efectiva
-    de la página coincida con target_date (o hasta timeout).
-    Devuelve la fecha efectiva final.
+    CLIC real en el datepicker para hoy-2, pulsar Buscar y
+    ESPERAR a que la banda azul muestre exactamente hoy-2.
+    Devuelve True si lo consigue; False si no.
     """
     page.goto(TM_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
     dbg(page, "03_tm_loaded")
 
-    ymd      = target_date.strftime("%Y-%m-%d")
-    ddmmyyyy = target_date.strftime("%d/%m/%Y")
+    # localizar el input asociado a 'Día'
+    dia_input = page.locator("input").first
+    try:
+        lab = page.locator("label:has-text('Día')").first
+        if lab.count():
+            cand = lab.locator("xpath=following::input[1]").first
+            if cand.count(): dia_input = cand
+    except: pass
 
-    # 1) Rellenar el datepicker
-    filled = False
-    for sel in [
-        'input[type="date"]',
-        'input[name*="dia"]','input[id*="dia"]',
-        'input[name*="date"]','input[id*="date"]',
-        'input[placeholder*="dd"]','input[placeholder*="día"]','input[placeholder*="Dia"]'
-    ]:
+    def month_on_calendar():
         try:
+            head = page.locator(".datepicker-days .datepicker-switch, .datepicker .datepicker-switch").first
+            if head.count():
+                txt = head.inner_text().strip().lower()
+                parts = txt.split()
+                if len(parts) >= 2 and parts[0] in MES_ES:
+                    return MES_ES[parts[0]], int(parts[-1])
+        except: pass
+        return None
+
+    for attempt in range(retries):
+        # abrir calendario
+        dia_input.click(force=True)
+        page.wait_for_timeout(200)
+
+        # llevar calendario al mes/año deseado
+        for _ in range(24):
+            cur = month_on_calendar()
+            if not cur: break
+            mm, yy = cur
+            if (yy, mm) == (target_date.year, target_date.month): break
+            if (yy, mm) < (target_date.year, target_date.month):
+                page.locator(".datepicker-days .next, .datepicker .next").first.click()
+            else:
+                page.locator(".datepicker-days .prev, .datepicker .prev").first.click()
+            page.wait_for_timeout(120)
+
+        # clic en el día
+        day_str = str(target_date.day)
+        day_cell = page.locator(".datepicker-days td.day:not(.old):not(.new)").filter(has_text=day_str).first
+        if day_cell.count():
+            day_cell.click()
+        else:
+            # fallback: escribir dd/mm/yyyy + Enter
+            dia_input.fill(target_date.strftime("%d/%m/%Y"))
+            dia_input.press("Enter")
+
+        # pulsar Buscar
+        clicked = False
+        for sel in ["button:has-text('Buscar')",
+                    "input[type='submit'][value*='Buscar']",
+                    "button[title*='Buscar']",
+                    'text=/^\\s*Buscar\\s*$/i']:
             if page.locator(sel).first.count():
-                page.locator(sel).first.fill(ymd)
-                page.keyboard.press("Enter")
-                filled = True
-                break
-        except:
-            pass
+                page.locator(sel).first.click(); clicked = True; break
+        if not clicked:
+            dia_input.press("Enter")
 
-    if not filled:
-        try:
-            page.evaluate("""(dmy) => {
-                const inputs = Array.from(document.querySelectorAll('input'))
-                  .filter(i => i.offsetParent && i.type !== 'hidden');
-                if (inputs[0]) {
-                  inputs[0].value = dmy;
-                  inputs[0].dispatchEvent(new Event('input', {bubbles:true}));
-                  inputs[0].dispatchEvent(new Event('change', {bubbles:true}));
-                }
-            }""", ddmmyyyy)
-        except:
-            pass
+        # esperar a que la banda muestre exactamente hoy-2
+        t0 = time.time()
+        while time.time() - t0 < max_wait_s:
+            eff = read_effective_date_from_page(page, target_date)
+            if eff.date() == target_date.date():
+                dbg(page, f"05_after_search_ok_attempt{attempt+1}")
+                return True
+            page.wait_for_timeout(500)
 
-    # 2) Pulsar Buscar (o Enter)
-    clicked = False
-    for sel in [
-        "button:has-text('Buscar')",
-        "input[type='submit'][value*='Buscar']",
-        "button[title*='Buscar']",
-        'text=/^\\s*Buscar\\s*$/i'
-    ]:
-        if page.locator(sel).first.count():
-            page.locator(sel).first.click()
-            clicked = True
-            break
-    if not clicked:
-        page.keyboard.press("Enter")
+        # si no coincidió, pequeño ajuste por JS y reintento
+        page.evaluate("""(iso, dmy) => {
+            const dt = document.querySelector('input[type="date"]');
+            if (dt) {
+              dt.value = iso;
+              dt.dispatchEvent(new Event('input',{bubbles:true}));
+              dt.dispatchEvent(new Event('change',{bubbles:true}));
+            }
+            const lab = Array.from(document.querySelectorAll('label'))
+              .find(l => /d[ií]a/i.test(l.textContent||''));
+            if (lab) {
+              const input = lab.parentElement.querySelector('input');
+              if (input) {
+                input.value = dmy;
+                input.dispatchEvent(new Event('input',{bubbles:true}));
+                input.dispatchEvent(new Event('change',{bubbles:true}));
+              }
+            }
+        }""", target_date.strftime("%Y-%m-%d"), target_date.strftime("%d/%m/%Y"))
+        page.wait_for_timeout(200)
 
-    # 3) Espera activa hasta que la fecha efectiva coincida con target (o timeout)
-    t0 = time.time()
-    effective = read_effective_date_from_page(page, target_date)
-    while (effective.date() != target_date.date()) and (time.time() - t0 < max_wait_s):
-        time.sleep(1.0)
-        effective = read_effective_date_from_page(page, target_date)
+    dbg(page, "05_after_search_fail")
+    return False
 
-    dbg(page, "05_after_search_wait")
-    return effective
-
+# ========================== EXTRAER TABLA ==========================
 def extract_table(page) -> pd.DataFrame:
     try:
         page.wait_for_selector("table", timeout=30000)
@@ -462,20 +500,23 @@ def run():
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
-        # Login
         login_tm(page)
 
-        # Fecha solicitada
         target = day_target()
-        print(f"[INFO] Fecha solicitada (hoy-2): {target:%Y-%m-%d}")
+        print(f"[INFO] Objetivo (hoy-2): {target:%Y-%m-%d}")
 
-        # Seleccionar y ESPERAR hasta que coincida (o ajustar a efectiva)
-        effective = open_tm_and_search_and_wait(page, target, max_wait_s=30)
-        if effective.date() != target.date():
-            print(f"[WARN] La web quedó en {effective:%Y-%m-%d} (no {target:%Y-%m-%d}). Ajustamos a la fecha efectiva.")
-            target = effective
+        ok = open_tm_and_search_force_exact(page, target, max_wait_s=30, retries=4)
 
-        # Tabla del día (coherente con 'target' efectivo)
+        if not ok:
+            print(f"[WARN] La web NO mostró {target:%Y-%m-%d} tras reintentos.")
+            if STRICT_HOY2:
+                write_no_data(target)
+                dbg(page, "07_done_no_data")
+                browser.close()
+                return
+            # modo laxo: usar la efectiva (desaconsejado para tu caso)
+            # target = read_effective_date_from_page(page, target)
+
         try:
             df = extract_table(page)
         except Exception as e:
@@ -488,14 +529,12 @@ def run():
         dbg(page, "06_table")
         print(f"[INFO] Filas en tabla: {len(df)}")
 
-        # Columna del medio
         candidates = [c for c in df.columns if norm(c) in {
             "nombre","medio","site","sitio","dominio","brand","marca","titulo","name"
         }]
         media_col = candidates[0] if candidates else df.columns[0]
         print(f"[INFO] Columna medio: {media_col}")
 
-        # Output normalizado
         out = shape_output(df, media_col, forced_date=target)
         print(f"[INFO] Filas tras filtro dominios: {len(out)}")
 
@@ -506,14 +545,11 @@ def run():
             browser.close()
             return
 
-        # 1) OJD (histórico por medio)
         write_append_and_dedupe_types(out)
 
-        # 2) Hojas comparativas (una fila / día)
         for sheet, (A, B) in PAIR_SHEETS.items():
             upsert_pair_sheet(sheet, A, B, out, target)
 
-        # 3) Hoja MDB (un solo medio)
         for sheet, M in SINGLE_SHEET.items():
             upsert_single_sheet(sheet, M, out, target)
 
