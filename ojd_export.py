@@ -1,4 +1,4 @@
-import os, re, pathlib
+import os, re, pathlib, time
 from json import loads as json_loads
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -43,7 +43,7 @@ def day_target() -> datetime:
     return now - timedelta(days=2)
 
 def guard_1215() -> bool:
-    # Sin bloqueo horario
+    # Sin bloqueo horario (el YAML decide cuándo correr)
     return True
 
 def norm(s: str) -> str:
@@ -159,7 +159,7 @@ def _to_serial_rows(rows):
 
 def _write_ws_with_formats(target_ws, values):
     target_ws.clear()
-    # MUY IMPORTANTE: rango simple "A1" (evita 'OJD!OJD!A1')
+    # IMPORTANTE: rango simple "A1" (evita 'OJD!OJD!A1')
     target_ws.update("A1", values)
     fmt_date = CellFormat(numberFormat=numberFormat(type="DATE", pattern="yyyy-mm-dd"))
     fmt_num  = CellFormat(numberFormat=numberFormat(type="NUMBER", pattern="#,##0"))
@@ -350,62 +350,6 @@ def login_tm(page):
     if page.locator("h1:has-text('Inicio de sesión')").count():
         raise RuntimeError("Login fallido (pantalla de login sigue visible).")
 
-def open_tm_and_search(page, target_date: datetime):
-    page.goto(TM_URL, wait_until="domcontentloaded")
-    page.wait_for_load_state("networkidle")
-    dbg(page, "03_tm")
-
-    ymd      = target_date.strftime("%Y-%m-%d")
-    ddmmyyyy = target_date.strftime("%d/%m/%Y")
-
-    # Intenta campos típicos
-    filled = False
-    for sel in [
-        'input[type="date"]',
-        'input[name*="dia"]','input[id*="dia"]',
-        'input[name*="date"]','input[id*="date"]',
-        'input[placeholder*="dd"]','input[placeholder*="día"]','input[placeholder*="Dia"]'
-    ]:
-        try:
-            if page.locator(sel).first.count():
-                page.locator(sel).first.fill(ymd)
-                page.keyboard.press("Enter")
-                filled = True
-                break
-        except: pass
-
-    # Fallback: inyecta valor
-    if not filled:
-        try:
-            page.evaluate("""(dmy) => {
-                const inputs = Array.from(document.querySelectorAll('input'))
-                  .filter(i => i.offsetParent && i.type !== 'hidden');
-                if (inputs[0]) {
-                  inputs[0].value = dmy;
-                  inputs[0].dispatchEvent(new Event('input', {bubbles:true}));
-                  inputs[0].dispatchEvent(new Event('change', {bubbles:true}));
-                }
-            }""", ddmmyyyy)
-        except: pass
-
-    page.wait_for_load_state("networkidle")
-    dbg(page, "04_date_set")
-
-    clicked = False
-    for sel in [
-        "button:has-text('Buscar')",
-        "input[type='submit'][value*='Buscar']",
-        "button[title*='Buscar']",
-        'text=/^\\s*Buscar\\s*$/i'
-    ]:
-        if page.locator(sel).first.count():
-            page.locator(sel).first.click(); clicked = True; break
-    if not clicked:
-        page.keyboard.press("Enter")
-
-    page.wait_for_load_state("networkidle")
-    dbg(page, "05_after_search")
-
 def read_effective_date_from_page(page, fallback: datetime) -> datetime:
     # 1) valor del input[type=date]
     try:
@@ -424,6 +368,75 @@ def read_effective_date_from_page(page, fallback: datetime) -> datetime:
     except:
         pass
     return fallback
+
+def open_tm_and_search_and_wait(page, target_date: datetime, max_wait_s: int = 30) -> datetime:
+    """
+    Selecciona fecha, pulsa Buscar y espera hasta que la fecha efectiva
+    de la página coincida con target_date (o hasta timeout).
+    Devuelve la fecha efectiva final.
+    """
+    page.goto(TM_URL, wait_until="domcontentloaded")
+    page.wait_for_load_state("networkidle")
+    dbg(page, "03_tm_loaded")
+
+    ymd      = target_date.strftime("%Y-%m-%d")
+    ddmmyyyy = target_date.strftime("%d/%m/%Y")
+
+    # 1) Rellenar el datepicker
+    filled = False
+    for sel in [
+        'input[type="date"]',
+        'input[name*="dia"]','input[id*="dia"]',
+        'input[name*="date"]','input[id*="date"]',
+        'input[placeholder*="dd"]','input[placeholder*="día"]','input[placeholder*="Dia"]'
+    ]:
+        try:
+            if page.locator(sel).first.count():
+                page.locator(sel).first.fill(ymd)
+                page.keyboard.press("Enter")
+                filled = True
+                break
+        except:
+            pass
+
+    if not filled:
+        try:
+            page.evaluate("""(dmy) => {
+                const inputs = Array.from(document.querySelectorAll('input'))
+                  .filter(i => i.offsetParent && i.type !== 'hidden');
+                if (inputs[0]) {
+                  inputs[0].value = dmy;
+                  inputs[0].dispatchEvent(new Event('input', {bubbles:true}));
+                  inputs[0].dispatchEvent(new Event('change', {bubbles:true}));
+                }
+            }""", ddmmyyyy)
+        except:
+            pass
+
+    # 2) Pulsar Buscar (o Enter)
+    clicked = False
+    for sel in [
+        "button:has-text('Buscar')",
+        "input[type='submit'][value*='Buscar']",
+        "button[title*='Buscar']",
+        'text=/^\\s*Buscar\\s*$/i'
+    ]:
+        if page.locator(sel).first.count():
+            page.locator(sel).first.click()
+            clicked = True
+            break
+    if not clicked:
+        page.keyboard.press("Enter")
+
+    # 3) Espera activa hasta que la fecha efectiva coincida con target (o timeout)
+    t0 = time.time()
+    effective = read_effective_date_from_page(page, target_date)
+    while (effective.date() != target_date.date()) and (time.time() - t0 < max_wait_s):
+        time.sleep(1.0)
+        effective = read_effective_date_from_page(page, target_date)
+
+    dbg(page, "05_after_search_wait")
+    return effective
 
 def extract_table(page) -> pd.DataFrame:
     try:
@@ -454,16 +467,15 @@ def run():
 
         # Fecha solicitada
         target = day_target()
-        print(f"[INFO] Fecha solicitada (hoy-2): {target.strftime('%Y-%m-%d')}")
-        open_tm_and_search(page, target)
+        print(f"[INFO] Fecha solicitada (hoy-2): {target:%Y-%m-%d}")
 
-        # Fecha efectiva que muestra la web
-        effective = read_effective_date_from_page(page, target)
+        # Seleccionar y ESPERAR hasta que coincida (o ajustar a efectiva)
+        effective = open_tm_and_search_and_wait(page, target, max_wait_s=30)
         if effective.date() != target.date():
-            print(f"[WARN] La web muestra {effective.strftime('%Y-%m-%d')} (no {target.strftime('%Y-%m-%d')}). Usaremos la fecha efectiva.")
+            print(f"[WARN] La web quedó en {effective:%Y-%m-%d} (no {target:%Y-%m-%d}). Ajustamos a la fecha efectiva.")
             target = effective
 
-        # Tabla
+        # Tabla del día (coherente con 'target' efectivo)
         try:
             df = extract_table(page)
         except Exception as e:
@@ -510,4 +522,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
