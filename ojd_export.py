@@ -33,7 +33,6 @@ try:
 except gspread.exceptions.WorksheetNotFound:
     ws = sh.add_worksheet(title=SHEET_TAB, rows=2000, cols=10)
 
-# Cabecera esperada (normalizada)
 HEADER = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
 
 # ========================== UTILS ==========================
@@ -52,7 +51,6 @@ def ymd(d: datetime) -> str:
     return d.strftime("%Y-%m-%d")
 
 def gs_date_serial(d: date) -> int:
-    # Serial de Google Sheets (base 1899-12-30)
     return (d - date(1899, 12, 30)).days
 
 def norm(s: str) -> str:
@@ -157,26 +155,21 @@ def _write_ws_with_formats(target_ws, values):
         print(f"[FORMAT][WARN] {e}")
 
 def _read_or_init_df():
-    """Devuelve un DataFrame con columnas HEADER, creando/saneando cabecera si hace falta."""
     vals = ws.get_all_values()
     if not vals:
-        # hoja vacía → crear cabecera
         _write_ws_with_formats(ws, [HEADER])
         return pd.DataFrame(columns=HEADER)
     cols = vals[0]
     data = vals[1:]
     df = pd.DataFrame(data, columns=cols) if data else pd.DataFrame(columns=cols)
-    # Asegurar columnas HEADER; si faltan, crearlas vacías:
     for c in HEADER:
         if c not in df.columns:
             df[c] = ""
-    # Reordenar
     df = df[HEADER]
     return df
 
 def write_append_and_dedupe_types(df_new: pd.DataFrame):
     df_old = _read_or_init_df()
-    # convertir numéricos
     for c in ("Navegadores Únicos","Visitas","Páginas Vistas"):
         if c in df_old.columns:
             df_old[c] = pd.to_numeric(
@@ -198,7 +191,6 @@ def write_no_data(target_dt: datetime):
     df_old = _read_or_init_df()
     row = {"Fecha": ymd(target_dt), "Nombre": "NO HAY DATOS",
            "Navegadores Únicos": "", "Visitas": "", "Páginas Vistas": ""}
-    # ¿ya existe el aviso para esa fecha?
     mask = (df_old["Fecha"] == row["Fecha"]) & (df_old["Nombre"] == "NO HAY DATOS")
     if mask.any():
         print("[INFO] Aviso 'NO HAY DATOS' ya presente; no se duplica.")
@@ -210,7 +202,6 @@ def write_no_data(target_dt: datetime):
 # ========================== PLAYWRIGHT HELPERS ==========================
 def login_tm(page):
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    # cookies
     for txt in ["ACEPTAR TODO","Aceptar todo","Aceptar cookies","RECHAZAR","Rechazar todo"]:
         try:
             b = page.get_by_role("button", name=re.compile(txt, re.I))
@@ -221,11 +212,53 @@ def login_tm(page):
     page.get_by_role("button", name=re.compile(r"Acceder", re.I)).click()
     page.wait_for_load_state("networkidle")
 
+# ----- datepicker helpers -----
+MES_ES = {
+    "enero":1, "febrero":2, "marzo":3, "abril":4, "mayo":5, "junio":6,
+    "julio":7, "agosto":8, "septiembre":9, "setiembre":9, "octubre":10,
+    "noviembre":11, "diciembre":12
+}
+
+def _read_calendar_month_year(page):
+    sel_candidates = [
+        ".datepicker .datepicker-days .datepicker-switch",
+        ".datepicker .datepicker-switch",
+        ".ui-datepicker-title",
+        "div[class*='picker'] [class*='title']",
+    ]
+    for sel in sel_candidates:
+        if page.locator(sel).first.count():
+            txt = page.locator(sel).first.inner_text().strip().lower()
+            parts = txt.split()
+            if len(parts) >= 2:
+                try:
+                    mes = MES_ES.get(parts[0], None)
+                    anio = int(parts[-1])
+                    if mes and anio:
+                        return mes, anio
+                except:
+                    pass
+    return None, None
+
+def _calendar_click_day(page, day: int):
+    day_selectors = [
+        f".datepicker-days td.day:not(.old):not(.new):has-text('{day}')",
+        f".datepicker td.day:not(.old):not(.new):has-text('{day}')",
+        f".ui-datepicker-calendar td a:text-is('{day}')",
+        f"//td[not(contains(@class,'old') or contains(@class,'new')) and normalize-space()='{day}']",
+    ]
+    for sel in day_selectors:
+        loc = page.locator(sel).first
+        if loc.count():
+            loc.click()
+            return True
+    return False
+
 def set_date_and_search(page, dt: datetime):
     page.goto(TM_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
 
-    # localizar input del día
+    # localizar input del día y abrir calendario
     dia_input = None
     try:
         lab = page.locator("label:has-text('Día')").first
@@ -237,31 +270,70 @@ def set_date_and_search(page, dt: datetime):
         x = page.locator("input[type='date']").first
         if x.count(): dia_input = x
     if not dia_input:
-        dia_input = page.locator("input").first
+        dia_input = page.locator("input:visible").first
 
-    # escribir dd/mm/yyyy y también value ISO si es type=date
-    dia_input.fill(dmy(dt))
-    try:
-        page.evaluate("""(iso) => {
-            const dt = document.querySelector('input[type="date"]');
-            if (dt) {
-              dt.value = iso;
-              dt.dispatchEvent(new Event('input',{bubbles:true}));
-              dt.dispatchEvent(new Event('change',{bubbles:true}));
-            }
-        }""", ymd(dt))
-    except: pass
+    dia_input.click()
+    page.wait_for_timeout(250)
 
-    # Buscar
+    cal_container = page.locator(".datepicker:visible, .ui-datepicker:visible").first
+    if not cal_container.count():
+        # plan B: set value programáticamente
+        try:
+            page.evaluate("""(iso) => {
+                const inp = document.querySelector('input[type="date"]') || document.querySelector('input');
+                if (inp) {
+                  inp.value = iso;
+                  inp.dispatchEvent(new Event('input',{bubbles:true}));
+                  inp.dispatchEvent(new Event('change',{bubbles:true}));
+                }
+            }""", ymd(dt))
+        except: pass
+    else:
+        target_month, target_year, target_day = dt.month, dt.year, dt.day
+        next_btn = cal_container.locator(".next, .datepicker-next, .ui-datepicker-next").first
+        prev_btn = cal_container.locator(".prev, .datepicker-prev, .ui-datepicker-prev").first
+
+        for _ in range(24):
+            m, y = _read_calendar_month_year(page)
+            if m == target_month and y == target_year:
+                break
+            if m is None or y is None:
+                if next_btn.count(): next_btn.click()
+                page.wait_for_timeout(150)
+                continue
+            if (y < target_year) or (y == target_year and m < target_month):
+                if next_btn.count(): next_btn.click()
+            else:
+                if prev_btn.count(): prev_btn.click()
+            page.wait_for_timeout(150)
+
+        if not _calendar_click_day(page, target_day):
+            try:
+                dia_input.fill(dmy(dt))
+                page.evaluate("""(iso) => {
+                    const inp = document.querySelector('input[type="date"]') || document.querySelector('input');
+                    if (inp) {
+                      inp.value = iso;
+                      inp.dispatchEvent(new Event('input',{bubbles:true}));
+                      inp.dispatchEvent(new Event('change',{bubbles:true}));
+                    }
+                }""", ymd(dt))
+            except: pass
+
+    # pulsar Buscar (o Enter)
     clicked = False
     for sel in ["button:has-text('Buscar')",
                 "input[type='submit'][value*='Buscar']",
                 "button[title*='Buscar']",
-                'text=/^\\s*Buscar\\s*$/i']:
-        if page.locator(sel).first.count():
-            page.locator(sel).first.click(); clicked = True; break
+                'text/^\\s*Buscar\\s*$/i']:
+        loc = page.locator(sel).first
+        if loc.count():
+            loc.click(); clicked = True; break
     if not clicked:
         dia_input.press("Enter")
+
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(600)
 
 def table_fingerprint(page) -> str:
     try:
@@ -289,15 +361,14 @@ def run():
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
-        # 1) Login
         login_tm(page)
 
-        # 2) Cargar prev (hoy-3) y sacar fingerprint
+        # fingerprint hoy-3
         set_date_and_search(page, prev)
         time.sleep(2.0)
         fp_prev = table_fingerprint(page)
 
-        # 3) Cargar target (hoy-2) y comparar fingerprint
+        # hoy-2 y comparación
         set_date_and_search(page, target)
         t0 = time.time()
         fp_tgt = ""
@@ -320,7 +391,7 @@ def run():
             browser.close()
             return
 
-        # 4) Construir salida y filtrar 6 medios
+        # construir salida para los 6 medios
         candidates = [c for c in df_tgt.columns if norm(c) in {
             "nombre","medio","site","sitio","dominio","brand","marca","titulo","name"
         }]
@@ -333,7 +404,6 @@ def run():
             browser.close()
             return
 
-        # 5) Escribir a la base (con formatos y sin duplicar)
         write_append_and_dedupe_types(out)
 
         browser.close()
@@ -341,3 +411,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
