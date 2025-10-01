@@ -47,7 +47,7 @@ def ymd(d: datetime) -> str:
     return d.strftime("%Y-%m-%d")
 
 def gs_date_serial(d: date) -> int:
-    return (d - date(1899, 12, 30)).days)
+    return (d - date(1899, 12, 30)).days  # <-- corregido
 
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", unidecode(str(s).lower()))
@@ -212,7 +212,6 @@ def set_date_and_search(page, dt: datetime):
             if cand.count(): dia_input = cand
     except: pass
     if not dia_input:
-        # prueba input[type=date]
         x = page.locator("input[type='date']").first
         if x.count(): dia_input = x
     if not dia_input:
@@ -274,7 +273,7 @@ def run():
 
         # 2) Cargar prev (hoy-3) y sacar fingerprint + tabla
         set_date_and_search(page, prev)
-        time.sleep(2.0)  # margen de red
+        time.sleep(2.0)
         fp_prev = table_fingerprint(page)
         df_prev = read_table(page)
 
@@ -282,7 +281,7 @@ def run():
         set_date_and_search(page, target)
         t0 = time.time()
         fp_tgt = ""
-        while time.time() - t0 < 12:  # hasta ~12s esperando recarga
+        while time.time() - t0 < 12:
             fp_tgt = table_fingerprint(page)
             if fp_tgt and fp_tgt != fp_prev:
                 break
@@ -302,7 +301,6 @@ def run():
             return
 
         # 4) Construir salida
-        # columna "medio"
         candidates = [c for c in df_tgt.columns if norm(c) in {
             "nombre","medio","site","sitio","dominio","brand","marca","titulo","name"
         }]
@@ -317,9 +315,6 @@ def run():
 
         # 5) Escribir a la base (con formatos)
         write_append_and_dedupe_types(out)
-
-        # (Opcional: si quieres también rellenar tus pestañas comparativas aquí,
-        # puedes reinsertar las funciones upsert_* del script anterior.)
 
         browser.close()
         print("[DONE] OK")
