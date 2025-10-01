@@ -33,8 +33,12 @@ try:
 except gspread.exceptions.WorksheetNotFound:
     ws = sh.add_worksheet(title=SHEET_TAB, rows=2000, cols=10)
 
+# Cabecera esperada (normalizada)
+HEADER = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
+
 # ========================== UTILS ==========================
 DEBUG_DIR = pathlib.Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
+
 def tz_now() -> datetime:
     return datetime.now(ZoneInfo("Europe/Madrid"))
 
@@ -43,11 +47,13 @@ def day_target() -> datetime:
 
 def dmy(d: datetime) -> str:
     return d.strftime("%d/%m/%Y")
+
 def ymd(d: datetime) -> str:
     return d.strftime("%Y-%m-%d")
 
 def gs_date_serial(d: date) -> int:
-    return (d - date(1899, 12, 30)).days  # <-- corregido
+    # Serial de Google Sheets (base 1899-12-30)
+    return (d - date(1899, 12, 30)).days
 
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", unidecode(str(s).lower()))
@@ -124,6 +130,7 @@ def shape_output(df: pd.DataFrame, media_col: str, forced_date: datetime) -> pd.
     out = out.sort_values("__ord").drop(columns="__ord")
     return out
 
+# ---------- helpers de escritura ----------
 def _to_serial_rows(rows):
     out = []
     for r in rows:
@@ -149,41 +156,56 @@ def _write_ws_with_formats(target_ws, values):
     except Exception as e:
         print(f"[FORMAT][WARN] {e}")
 
-def write_append_and_dedupe_types(df_new: pd.DataFrame):
+def _read_or_init_df():
+    """Devuelve un DataFrame con columnas HEADER, creando/saneando cabecera si hace falta."""
     vals = ws.get_all_values()
-    header = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
     if not vals:
-        data = df_new.astype(object).where(pd.notna(df_new), "").values.tolist()
-        _write_ws_with_formats(ws, [header] + _to_serial_rows(data)); return
+        # hoja vacía → crear cabecera
+        _write_ws_with_formats(ws, [HEADER])
+        return pd.DataFrame(columns=HEADER)
+    cols = vals[0]
+    data = vals[1:]
+    df = pd.DataFrame(data, columns=cols) if data else pd.DataFrame(columns=cols)
+    # Asegurar columnas HEADER; si faltan, crearlas vacías:
+    for c in HEADER:
+        if c not in df.columns:
+            df[c] = ""
+    # Reordenar
+    df = df[HEADER]
+    return df
 
-    df_old = pd.DataFrame(vals[1:], columns=vals[0])
+def write_append_and_dedupe_types(df_new: pd.DataFrame):
+    df_old = _read_or_init_df()
+    # convertir numéricos
     for c in ("Navegadores Únicos","Visitas","Páginas Vistas"):
         if c in df_old.columns:
             df_old[c] = pd.to_numeric(
-                df_old[c].str.replace(".","",regex=False).str.replace(",","",regex=False),
+                df_old[c].astype(str).str.replace(".","",regex=False).str.replace(",","",regex=False),
                 errors="coerce"
             ).astype("Int64")
-
     combo = pd.concat([df_old, df_new], ignore_index=True)
     combo = combo.drop_duplicates(subset=["Fecha","Nombre"], keep="last")
 
     order_index = {TARGET_NAMES[k]: i for i,k in enumerate(ORDER_KEYS)}
     combo["__ord"] = combo["Nombre"].map(lambda x: order_index.get(x, 999))
     combo = combo.sort_values(["Fecha","__ord"]).drop(columns="__ord")
+
     rows = combo.astype(object).where(pd.notna(combo), "").values.tolist()
-    _write_ws_with_formats(ws, [header] + _to_serial_rows(rows))
+    _write_ws_with_formats(ws, [HEADER] + _to_serial_rows(rows))
 
 # ========================== NO HAY DATOS ==========================
 def write_no_data(target_dt: datetime):
-    row = [[ymd(target_dt), "NO HAY DATOS", "", "", ""]]
-    vals = ws.get_all_values()
-    header = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
-    if not vals:
-        ws.update("A1", [header] + row)
-    else:
-        df_old = pd.DataFrame(vals[1:], columns=vals[0])
-        if not ((df_old["Fecha"] == row[0][0]) & (df_old["Nombre"] == "NO HAY DATOS")).any():
-            ws.append_row(row[0], value_input_option="USER_ENTERED")
+    df_old = _read_or_init_df()
+    row = {"Fecha": ymd(target_dt), "Nombre": "NO HAY DATOS",
+           "Navegadores Únicos": "", "Visitas": "", "Páginas Vistas": ""}
+    # ¿ya existe el aviso para esa fecha?
+    mask = (df_old["Fecha"] == row["Fecha"]) & (df_old["Nombre"] == "NO HAY DATOS")
+    if mask.any():
+        print("[INFO] Aviso 'NO HAY DATOS' ya presente; no se duplica.")
+        return
+    df_new = pd.concat([df_old, pd.DataFrame([row])], ignore_index=True)
+    rows = df_new.astype(object).where(pd.notna(df_new), "").values.tolist()
+    _write_ws_with_formats(ws, [HEADER] + _to_serial_rows(rows))
 
 # ========================== PLAYWRIGHT HELPERS ==========================
 def login_tm(page):
@@ -203,7 +225,7 @@ def set_date_and_search(page, dt: datetime):
     page.goto(TM_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
 
-    # localizar input del día (intenta por label y, si no, primer input con date o texto)
+    # localizar input del día
     dia_input = None
     try:
         lab = page.locator("label:has-text('Día')").first
@@ -217,7 +239,7 @@ def set_date_and_search(page, dt: datetime):
     if not dia_input:
         dia_input = page.locator("input").first
 
-    # estrategia doble: escribir dd/mm/yyyy y también value ISO (si es <input type=date>)
+    # escribir dd/mm/yyyy y también value ISO si es type=date
     dia_input.fill(dmy(dt))
     try:
         page.evaluate("""(iso) => {
@@ -230,7 +252,7 @@ def set_date_and_search(page, dt: datetime):
         }""", ymd(dt))
     except: pass
 
-    # click Buscar o Enter
+    # Buscar
     clicked = False
     for sel in ["button:has-text('Buscar')",
                 "input[type='submit'][value*='Buscar']",
@@ -259,7 +281,6 @@ def read_table(page) -> pd.DataFrame:
 # ========================== MAIN ==========================
 def run():
     print("[START] ojd_export.py")
-
     target = day_target()
     prev   = target - timedelta(days=1)  # hoy-3
 
@@ -271,11 +292,10 @@ def run():
         # 1) Login
         login_tm(page)
 
-        # 2) Cargar prev (hoy-3) y sacar fingerprint + tabla
+        # 2) Cargar prev (hoy-3) y sacar fingerprint
         set_date_and_search(page, prev)
         time.sleep(2.0)
         fp_prev = table_fingerprint(page)
-        df_prev = read_table(page)
 
         # 3) Cargar target (hoy-2) y comparar fingerprint
         set_date_and_search(page, target)
@@ -288,19 +308,19 @@ def run():
             time.sleep(0.6)
 
         if not fp_tgt or fp_tgt == fp_prev:
-            print("[INFO] La tabla de hoy-2 coincide con la de hoy-3 ⇒ NO HAY DATOS.")
+            print("[INFO] La tabla de hoy-2 coincide con la de hoy-3 -> NO HAY DATOS.")
             write_no_data(target)
             browser.close()
             return
 
         df_tgt = read_table(page)
         if df_tgt.empty:
-            print("[INFO] Tabla vacía para hoy-2 ⇒ NO HAY DATOS.")
+            print("[INFO] Tabla vacía para hoy-2 -> NO HAY DATOS.")
             write_no_data(target)
             browser.close()
             return
 
-        # 4) Construir salida
+        # 4) Construir salida y filtrar 6 medios
         candidates = [c for c in df_tgt.columns if norm(c) in {
             "nombre","medio","site","sitio","dominio","brand","marca","titulo","name"
         }]
@@ -308,12 +328,12 @@ def run():
         out = shape_output(df_tgt, media_col, target)
 
         if out.empty:
-            print("[INFO] Tras filtro de medios, no hay filas ⇒ NO HAY DATOS.")
+            print("[INFO] Tras filtro de medios, no hay filas -> NO HAY DATOS.")
             write_no_data(target)
             browser.close()
             return
 
-        # 5) Escribir a la base (con formatos)
+        # 5) Escribir a la base (con formatos y sin duplicar)
         write_append_and_dedupe_types(out)
 
         browser.close()
@@ -321,4 +341,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
