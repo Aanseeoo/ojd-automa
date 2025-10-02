@@ -17,6 +17,9 @@ TM_URL    = "https://www.ojdinteractiva.es/traffic-monitoring/traffic-monitoring
 OJD_USER = os.environ["OJD_USER"]
 OJD_PASS = os.environ["OJD_PASS"]
 
+# Opcional: forzar fecha (dd/mm/yyyy), útil para pruebas o re-procesos
+FORCE_DATE_STR = os.getenv("FORCE_DATE_DDMMYYYY", "").strip()
+
 # ========================== GOOGLE SHEETS ==========================
 import gspread
 from google.oauth2.service_account import Credentials
@@ -39,15 +42,21 @@ DEBUG_DIR = pathlib.Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
 def tz_now() -> datetime:
     return datetime.now(ZoneInfo("Europe/Madrid"))
 
-def target_dt() -> datetime:
-    """La fecha que necesitamos: hoy-2 en Europa/Madrid."""
+def default_target_dt() -> datetime:
+    """Fecha por defecto: hoy-2 en Europa/Madrid."""
     return tz_now() - timedelta(days=2)
 
-def dmy(d: datetime) -> str:
-    return d.strftime("%d/%m/%Y")
+def dmy(d: datetime | date) -> str:
+    return (d if isinstance(d, datetime) else datetime.combine(d, datetime.min.time())).strftime("%d/%m/%Y")
 
-def ymd(d: datetime) -> str:
-    return d.strftime("%Y-%m-%d")
+def ymd(d: datetime | date) -> str:
+    return (d if isinstance(d, datetime) else datetime.combine(d, datetime.min.time())).strftime("%Y-%m-%d")
+
+def parse_dmy(s: str) -> datetime | None:
+    try:
+        return datetime.strptime(s.strip(), "%d/%m/%Y").replace(tzinfo=ZoneInfo("Europe/Madrid"))
+    except Exception:
+        return None
 
 def gs_date_serial(d: date) -> int:
     # Serial de Google Sheets (sistema 1899-12-30)
@@ -106,7 +115,7 @@ def pick_table(tables):
             best, score_best = t, score
     return best
 
-def shape_output(df: pd.DataFrame, media_col: str, forced_date: datetime) -> pd.DataFrame:
+def shape_output(df: pd.DataFrame, media_col: str, data_date: datetime) -> pd.DataFrame:
     def find_col(cands):
         for c in df.columns:
             nc = norm(c)
@@ -117,7 +126,7 @@ def shape_output(df: pd.DataFrame, media_col: str, forced_date: datetime) -> pd.
     pv_col      = find_col({"paginasvistas","pageviews","paginas","pv"})
 
     out = pd.DataFrame()
-    out["Fecha"] = ymd(forced_date)
+    out["Fecha"] = ymd(data_date)
     out["Nombre"] = df[media_col].map(canonical_name)
     out["Navegadores Únicos"] = df[navu_col].map(to_int)    if navu_col    else None
     out["Visitas"]            = df[visitas_col].map(to_int) if visitas_col else None
@@ -143,7 +152,8 @@ def _to_serial_rows(rows):
         out.append(rr)
     return out
 
-def _write_ws_with_formats(target_ws, values):
+def _write_ws_with_formats_overwrite(target_ws, values):
+    """Sobrescribe toda la hoja con cabecera+datos y aplica formatos."""
     target_ws.clear()
     target_ws.update("A1", values)
     fmt_date = CellFormat(numberFormat=numberFormat(type="DATE", pattern="yyyy-mm-dd"))
@@ -154,42 +164,17 @@ def _write_ws_with_formats(target_ws, values):
     except Exception as e:
         print(f"[FORMAT][WARN] {e}")
 
-def write_append_and_dedupe_types(df_new: pd.DataFrame):
+def write_replace_all(df_new: pd.DataFrame):
+    """Siempre sobreescribe con los datos de esta ejecución."""
     header = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
-    vals = ws.get_all_values()
-    if not vals:
-        data = df_new.astype(object).where(pd.notna(df_new), "").values.tolist()
-        _write_ws_with_formats(ws, [header] + _to_serial_rows(data)); return
+    rows = df_new.astype(object).where(pd.notna(df_new), "").values.tolist()
+    _write_ws_with_formats_overwrite(ws, [header] + _to_serial_rows(rows))
 
-    df_old = pd.DataFrame(vals[1:], columns=vals[0])
-    for c in ("Navegadores Únicos","Visitas","Páginas Vistas"):
-        if c in df_old.columns:
-            df_old[c] = pd.to_numeric(
-                df_old[c].str.replace(".","",regex=False).str.replace(",","",regex=False),
-                errors="coerce"
-            ).astype("Int64")
-
-    combo = pd.concat([df_old, df_new], ignore_index=True)
-    combo = combo.drop_duplicates(subset=["Fecha","Nombre"], keep="last")
-
-    order_index = {TARGET_NAMES[k]: i for i,k in enumerate(ORDER_KEYS)}
-    combo["__ord"] = combo["Nombre"].map(lambda x: order_index.get(x, 999))
-    combo = combo.sort_values(["Fecha","__ord"]).drop(columns="__ord")
-    rows = combo.astype(object).where(pd.notna(combo), "").values.tolist()
-    _write_ws_with_formats(ws, [header] + _to_serial_rows(rows))
-
-def write_no_data(target: datetime):
-    """Inserta 'NO HAY DATOS' para esa fecha (una sola fila) si no existía."""
-    target_ymd = ymd(target)
-    vals = ws.get_all_values()
+def write_no_data_overwrite(data_date: datetime):
+    """Cuando no hay datos, sobreescribe con una sola fila 'NO HAY DATOS'."""
     header = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
-    row = [target_ymd, "NO HAY DATOS", "", "", ""]
-    if not vals:
-        _write_ws_with_formats(ws, [header, row]); return
-    df_old = pd.DataFrame(vals[1:], columns=vals[0]) if len(vals) > 1 else pd.DataFrame(columns=header)
-    mask = (df_old.get("Fecha","") == target_ymd) & (df_old.get("Nombre","") == "NO HAY DATOS")
-    if not mask.any():
-        ws.append_row(row, value_input_option="USER_ENTERED")
+    row = [ymd(data_date), "NO HAY DATOS", "", "", ""]
+    _write_ws_with_formats_overwrite(ws, [header, row])
 
 # ========================== PLAYWRIGHT ==========================
 def login_tm(page):
@@ -215,20 +200,18 @@ def set_date_and_search(page, dt: datetime) -> bool:
 
     wanted = dmy(dt)
     inp = page.locator("#datepicker")
-    # Espera a que exista el input
     inp.wait_for(state="visible", timeout=8000)
 
-    # Borrar y escribir (doble estrategia: fill + select_all+type)
+    # Borrar y escribir (fill + select_all + type)
     try:
-        inp.fill("")              # limpia
-        inp.fill(wanted)          # escribe
-        # por si queda basura, reescribe seleccionando todo:
+        inp.fill("")
+        inp.fill(wanted)
         inp.press("Control+a")
         inp.type(wanted, delay=20)
     except PWTimeout:
         return False
 
-    # Confirmar que quedó el valor correcto
+    # Confirmar valor
     ok = False
     for _ in range(4):
         try:
@@ -241,30 +224,29 @@ def set_date_and_search(page, dt: datetime) -> bool:
             time.sleep(0.4)
     if not ok:
         print(f"[WARN] No se pudo fijar la fecha correcta. Quedó: '{inp.input_value()}'")
-        # aún así seguimos, por si la web respeta el valor enviado.
 
-    # Pulsar Buscar (botón con icono lupa)
-    # selector robusto: botón submit o el que contenga .fa-search
+    # Pulsar Buscar
     clicked = False
-    for sel in [
-        "button[type='submit']",
-        "button:has(.fa-search)",
-        "form button.btn"
-    ]:
+    for sel in ["button[type='submit']", "button:has(.fa-search)", "form button.btn"]:
         loc = page.locator(sel)
         if loc.count():
             loc.first.click()
             clicked = True
             break
     if not clicked:
-        # último recurso: Enter en el input
         inp.press("Enter")
 
-    # Espera a que la tabla/all content se refresque
     page.wait_for_load_state("networkidle")
-    time.sleep(1.0)  # margen
-
+    time.sleep(1.0)
     return True
+
+def read_final_date_from_page(page) -> datetime | None:
+    """Lee el valor actual del #datepicker y lo convierte a datetime."""
+    try:
+        val = page.locator("#datepicker").input_value(timeout=4000).strip()
+        return parse_dmy(val)
+    except Exception:
+        return None
 
 def table_fingerprint(page) -> str:
     try:
@@ -288,8 +270,16 @@ def read_table(page) -> pd.DataFrame:
 # ========================== MAIN ==========================
 def run():
     print("[START] ojd_export.py")
-    tgt = target_dt()
-    print(f"[INFO] Fecha objetivo (hoy-2): {ymd(tgt)}")
+
+    # Fecha objetivo base
+    tgt = default_target_dt()
+    # Si hay FORCE_DATE, usamos esa
+    if FORCE_DATE_STR:
+        forced = parse_dmy(FORCE_DATE_STR)
+        if forced: tgt = forced
+        print(f"[INFO] FORCE_DATE_DDMMYYYY='{FORCE_DATE_STR}' -> objetivo {ymd(tgt)}")
+    else:
+        print(f"[INFO] Fecha objetivo (hoy-2): {ymd(tgt)}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -303,32 +293,19 @@ def run():
         ok = set_date_and_search(page, tgt)
         if not ok:
             print("[ERR] No fue posible preparar el filtro de fecha.")
-            write_no_data(tgt)
+            write_no_data_overwrite(tgt)
             browser.close()
             return
 
-        # 3) Verificar que la página está en la fecha deseada (valor del input)
-        try:
-            val_now = page.locator("#datepicker").input_value(timeout=4000)
-            print(f"[INFO] Datepicker ahora es: '{val_now}'")
-        except:
-            val_now = ""
-        if val_now.strip() != dmy(tgt):
-            print("[WARN] El datepicker no refleja hoy-2. Intento 2…")
-            # Un segundo intento rápido
-            set_date_and_search(page, tgt)
-            try:
-                val_now = page.locator("#datepicker").input_value(timeout=4000)
-            except:
-                val_now = ""
-            print(f"[INFO] Datepicker tras reintento: '{val_now}'")
+        # 3) Leemos la **fecha real** que usa la página
+        real_dt = read_final_date_from_page(page) or tgt
+        print(f"[INFO] Fecha confirmada en página: {ymd(real_dt)}")
 
         # 4) Leer tabla
-        fp_before = table_fingerprint(page)
         df = read_table(page)
         if df.empty:
             print("[INFO] No se pudo leer una tabla válida ⇒ NO HAY DATOS.")
-            write_no_data(tgt)
+            write_no_data_overwrite(real_dt)
             browser.close()
             return
 
@@ -338,15 +315,15 @@ def run():
         }]
         media_col = candidates[0] if candidates else df.columns[0]
 
-        out = shape_output(df, media_col, tgt)
+        out = shape_output(df, media_col, real_dt)
         if out.empty:
             print("[INFO] Tras filtro de medios, no hay filas ⇒ NO HAY DATOS.")
-            write_no_data(tgt)
+            write_no_data_overwrite(real_dt)
             browser.close()
             return
 
-        # 6) Escribir en la base con formatos y dedupe
-        write_append_and_dedupe_types(out)
+        # 6) **SOBREESCRIBIR** en la base con los datos actuales
+        write_replace_all(out)
 
         browser.close()
         print("[DONE] OK")
