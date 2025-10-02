@@ -1,11 +1,11 @@
-import os, re, pathlib, time, hashlib
+import os, re, pathlib, time
 from json import loads as json_loads
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 from unidecode import unidecode
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ========================== CONFIG ==========================
 SHEET_ID  = "1ra1VSpOZ6JuMp-S_MsqNbHEGr2n0VA702lbFsVBD-Os"  # Hoja base
@@ -19,21 +19,17 @@ OJD_PASS = os.environ["OJD_PASS"]
 
 HEADER = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
 
-# Debug snapshots
+# Debug
 ENABLE_DEBUG = True
 DEBUG_DIR = pathlib.Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
-
 def save_debug(page, name):
     if not ENABLE_DEBUG: return
+    try: page.screenshot(path=DEBUG_DIR / f"{name}.png", full_page=True)
+    except Exception: pass
     try:
-        page.screenshot(path=DEBUG_DIR / f"{name}.png", full_page=True)
-    except Exception as e:
-        print(f"[DEBUG][shot][WARN] {e}")
-    try:
-        with open(DEBUG_DIR / f"{name}.html", "w", encoding="utf-8") as f:
+        with open(DEBUG_DIR / f"{name}.html","w",encoding="utf-8") as f:
             f.write(page.content())
-    except Exception as e:
-        print(f"[DEBUG][html][WARN] {e}")
+    except Exception: pass
 
 # ========================== GOOGLE SHEETS ==========================
 import gspread
@@ -60,10 +56,8 @@ def day_target() -> datetime:
 
 def dmy(d: datetime) -> str:       # dd/mm/aaaa
     return d.strftime("%d/%m/%Y")
-
 def dmy_dash(d: datetime) -> str:  # dd-mm-aaaa
     return d.strftime("%d-%m-%Y")
-
 def ymd(d: datetime) -> str:       # aaaa-mm-dd
     return d.strftime("%Y-%m-%d")
 
@@ -88,10 +82,8 @@ ALIASES = {
     "diariodeibiza": {"diariodeibiza.es","diariodeibiza","diario de ibiza"},
     "mallorcamagazin": {"mallorcamagazin.es","mallorca magazin","mallorcamagazin.com"},
     "mallorcazeitung": {"mallorcazeitung.es","mallorca zeitung","mallorcazeitung.com"},
-    "majorcadaily": {
-        "majorcadailybulletin.es","majorcadaily","majorca daily bulletin",
-        "majorca daily","majorcadailybulletin.com"
-    },
+    "majorcadaily": {"majorcadailybulletin.es","majorcadaily","majorca daily bulletin",
+                     "majorca daily","majorcadailybulletin.com"},
 }
 ORDER_KEYS = ["ultimahora","diariodemallorca","diariodeibiza",
               "mallorcamagazin","mallorcazeitung","majorcadaily"]
@@ -147,7 +139,7 @@ def shape_output(df: pd.DataFrame, media_col: str, forced_date: datetime) -> pd.
     out = out.sort_values("__ord").drop(columns="__ord")
     return out
 
-# ---------- helpers de escritura ----------
+# ---------- escritura ----------
 def _write_ws_with_formats(target_ws, values):
     target_ws.clear()
     target_ws.update("A1", values)
@@ -164,14 +156,11 @@ def _read_or_init_df():
     if not vals:
         _write_ws_with_formats(ws, [HEADER])
         return pd.DataFrame(columns=HEADER)
-    cols = vals[0]
-    data = vals[1:]
+    cols = vals[0]; data = vals[1:]
     df = pd.DataFrame(data, columns=cols) if data else pd.DataFrame(columns=cols)
     for c in HEADER:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[HEADER]
-    return df
+        if c not in df.columns: df[c] = ""
+    return df[HEADER]
 
 def write_append_and_dedupe_types(df_new: pd.DataFrame):
     df_old = _read_or_init_df()
@@ -183,54 +172,45 @@ def write_append_and_dedupe_types(df_new: pd.DataFrame):
             ).astype("Int64")
     combo = pd.concat([df_old, df_new], ignore_index=True)
     combo = combo.drop_duplicates(subset=["Fecha","Nombre"], keep="last")
-
     order_index = {TARGET_NAMES[k]: i for i,k in enumerate(ORDER_KEYS)}
     combo["__ord"] = combo["Nombre"].map(lambda x: order_index.get(x, 999))
     combo = combo.sort_values(["Fecha","__ord"]).drop(columns="__ord")
-
-    rows = combo.astype(object).where(pd.notna(combo), "").values.tolist()
-
-    # convertir la columna Fecha (YYYY-MM-DD) a serial antes de subir
-    rows_serial = []
-    for r in rows:
+    # serializar fechas y números
+    rows = []
+    for r in combo.astype(object).where(pd.notna(combo), "").values.tolist():
         rr = list(r)
         try:
             dt = datetime.strptime(str(rr[0]), "%Y-%m-%d").date()
             rr[0] = gs_date_serial(dt)
         except: pass
         for i in (2,3,4):
-            try:
-                rr[i] = int(rr[i]) if rr[i] not in ("", None, "nan", "") else ""
+            try: rr[i] = int(rr[i]) if rr[i] not in ("", None, "nan") else ""
             except: pass
-        rows_serial.append(rr)
+        rows.append(rr)
+    _write_ws_with_formats(ws, [HEADER] + rows)
 
-    _write_ws_with_formats(ws, [HEADER] + rows_serial)
-
-# ========================== NO HAY DATOS ==========================
 def write_no_data(target_dt: datetime):
     df_old = _read_or_init_df()
     row = {"Fecha": ymd(target_dt), "Nombre": "NO HAY DATOS",
            "Navegadores Únicos": "", "Visitas": "", "Páginas Vistas": ""}
     mask = (df_old["Fecha"] == row["Fecha"]) & (df_old["Nombre"] == "NO HAY DATOS")
     if mask.any():
-        print("[INFO] Aviso 'NO HAY DATOS' ya presente; no se duplica.")
+        print("[INFO] Aviso ya presente.")
         return
     df_new = pd.concat([df_old, pd.DataFrame([row])], ignore_index=True)
-    rows = df_new.astype(object).where(pd.notna(df_new), "").values.tolist()
-    rows_serial = []
-    for r in rows:
+    rows = []
+    for r in df_new.astype(object).where(pd.notna(df_new), "").values.tolist():
         rr = list(r)
         try:
             dt = datetime.strptime(str(rr[0]), "%Y-%m-%d").date()
             rr[0] = gs_date_serial(dt)
         except: pass
-        rows_serial.append(rr)
-    _write_ws_with_formats(ws, [HEADER] + rows_serial)
+        rows.append(rr)
+    _write_ws_with_formats(ws, [HEADER] + rows)
 
-# ========================== PLAYWRIGHT (login / fecha / tabla) ==========================
+# ========================== PLAYWRIGHT ==========================
 def login_tm(page):
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    # cookies
     for txt in ["ACEPTAR TODO","Aceptar todo","Aceptar cookies","RECHAZAR","Rechazar todo"]:
         try:
             b = page.get_by_role("button", name=re.compile(txt, re.I))
@@ -271,7 +251,6 @@ def _force_value_via_js(page, iso_ymd):
     }""", iso_ymd)
 
 def current_ui_date(page) -> str | None:
-    """Devuelve dd/mm/aaaa si puede deducir la fecha activa de la UI."""
     try:
         banner = page.locator("text=Los datos de Día").first
         if banner.count():
@@ -279,11 +258,9 @@ def current_ui_date(page) -> str | None:
             m = re.search(r"D[íi]a\s+(\d{1,2})\s+([A-Za-zÁÉÍÓÚñç]+)\s+(\d{4})", txt)
             if m:
                 dd = int(m.group(1)); yy = int(m.group(3))
-                meses = {
-                    "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
-                    "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,
-                    "noviembre":11,"diciembre":12
-                }
+                meses = {"enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
+                         "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,
+                         "noviembre":11,"diciembre":12}
                 mm = meses.get(m.group(2).lower())
                 if mm: return f"{dd:02d}/{mm:02d}/{yy}"
     except: pass
@@ -298,38 +275,27 @@ def current_ui_date(page) -> str | None:
     return None
 
 def set_date_and_search(page, dt: datetime, tag: str):
-    """Escribe fecha dt, pulsa buscar, verifica; reintenta si no cuadra."""
     page.goto(TM_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-
     desired_ddmmyyyy = dmy(dt)
     desired_iso      = ymd(dt)
 
     for attempt in range(3):
         inp = _find_day_input(page)
         inp.click(); _select_all_delete(inp)
-
-        # 1) dd/mm/aaaa
         inp.fill(desired_ddmmyyyy)
-        inp.dispatch_event("input")
-        inp.dispatch_event("change")
-        inp.blur()
+        inp.dispatch_event("input"); inp.dispatch_event("change"); inp.blur()
         page.wait_for_timeout(150)
-
-        # 2) si quedó vacío, dd-mm-aaaa
+        val = ""
         try: val = inp.input_value().strip()
-        except: val = ""
+        except: pass
         if not val:
             inp.click(); _select_all_delete(inp)
             inp.fill(dmy_dash(dt))
-            inp.dispatch_event("input")
-            inp.dispatch_event("change")
-            inp.blur()
+            inp.dispatch_event("input"); inp.dispatch_event("change"); inp.blur()
             page.wait_for_timeout(150)
-
-        # 3) si aún no, forzar ISO por JS
-        try: val = inp.input_value().strip()
-        except: val = ""
+            try: val = inp.input_value().strip()
+            except: val = ""
         if not val:
             _force_value_via_js(page, desired_iso)
             page.wait_for_timeout(150)
@@ -349,26 +315,24 @@ def set_date_and_search(page, dt: datetime, tag: str):
         if not clicked:
             inp.press("Enter")
 
+        # Esperar a que haya filas en la tabla
+        try:
+            page.wait_for_selector("table tbody tr", timeout=12000)
+        except PWTimeout:
+            pass
+
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(600)
         save_debug(page, f"{tag}_attempt{attempt+1}")
 
         ui_date = current_ui_date(page)
         if ui_date == desired_ddmmyyyy:
-            print(f"[OK] Fecha fijada en la UI: {ui_date}")
+            print(f"[OK] Fecha fijada: {ui_date}")
             return
         else:
-            print(f"[WARN] Intento {attempt+1}: UI={ui_date} != {desired_ddmmyyyy}. Reintento…")
+            print(f"[WARN] Intento {attempt+1}: UI={ui_date} != {desired_ddmmyyyy}")
 
-    print("[ERROR] No se pudo fijar la fecha objetivo tras 3 intentos.")
-
-def table_fingerprint(page) -> str:
-    try:
-        if not page.locator("table").count(): return ""
-        html = page.locator("table").first.inner_html()
-        return hashlib.md5(html.encode("utf-8", errors="ignore")).hexdigest()
-    except:
-        return ""
+    print("[ERROR] No se pudo fijar la fecha tras 3 intentos.")
 
 def read_table(page) -> pd.DataFrame:
     html = page.content()
@@ -381,59 +345,32 @@ def read_table(page) -> pd.DataFrame:
 def run():
     print("[START] ojd_export.py")
     target = day_target()
-    prev   = target - timedelta(days=1)  # hoy-3
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
-        # Login
         login_tm(page)
 
-        # Fingerprint hoy-3 (para detectar si hoy-2 sigue mostrando lo mismo)
-        set_date_and_search(page, prev, "02_prev")
-        fp_prev = table_fingerprint(page)
+        # Ir directamente a hoy-2, verificar fecha y que haya filas
+        set_date_and_search(page, target, "target")
 
-        # hoy-2
-        set_date_and_search(page, target, "03_target")
-        # esperar un poco por si el render de tabla tarda
-        t0 = time.time()
-        fp_tgt = ""
-        while time.time() - t0 < 12:
-            fp_tgt = table_fingerprint(page)
-            if fp_tgt and fp_tgt != fp_prev:
-                break
-            time.sleep(0.6)
-
-        if not fp_tgt or fp_tgt == fp_prev:
-            print("[INFO] La tabla de hoy-2 coincide con la de hoy-3 -> NO HAY DATOS.")
-            write_no_data(target)
-            browser.close()
-            print("[DONE] OK (no data)")
-            return
-
-        df_tgt = read_table(page)
-        if df_tgt.empty:
+        df = read_table(page)
+        if df.empty:
             print("[INFO] Tabla vacía para hoy-2 -> NO HAY DATOS.")
-            write_no_data(target)
-            browser.close()
-            print("[DONE] OK (empty)")
-            return
+            write_no_data(target); browser.close(); print("[DONE]"); return
 
-        # Construir salida solo con los medios objetivo
-        candidates = [c for c in df_tgt.columns if norm(c) in {
+        # Seleccionar la columna de “medio”
+        candidates = [c for c in df.columns if norm(c) in {
             "nombre","medio","site","sitio","dominio","brand","marca","titulo","name"
         }]
-        media_col = candidates[0] if candidates else df_tgt.columns[0]
-        out = shape_output(df_tgt, media_col, target)
+        media_col = candidates[0] if candidates else df.columns[0]
 
+        out = shape_output(df, media_col, target)
         if out.empty:
-            print("[INFO] Tras filtro de medios, no hay filas -> NO HAY DATOS.")
-            write_no_data(target)
-            browser.close()
-            print("[DONE] OK (filtered empty)")
-            return
+            print("[INFO] Tras filtro de medios, ninguna fila -> NO HAY DATOS.")
+            write_no_data(target); browser.close(); print("[DONE]"); return
 
         write_append_and_dedupe_types(out)
         browser.close()
