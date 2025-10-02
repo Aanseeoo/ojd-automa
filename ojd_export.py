@@ -1,4 +1,4 @@
-import os, re, pathlib, time
+import os, re, time, pathlib, hashlib
 from json import loads as json_loads
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -17,20 +17,6 @@ TM_URL    = "https://www.ojdinteractiva.es/traffic-monitoring/traffic-monitoring
 OJD_USER = os.environ["OJD_USER"]
 OJD_PASS = os.environ["OJD_PASS"]
 
-HEADER = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
-
-# Debug
-ENABLE_DEBUG = True
-DEBUG_DIR = pathlib.Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
-def save_debug(page, name):
-    if not ENABLE_DEBUG: return
-    try: page.screenshot(path=DEBUG_DIR / f"{name}.png", full_page=True)
-    except Exception: pass
-    try:
-        with open(DEBUG_DIR / f"{name}.html","w",encoding="utf-8") as f:
-            f.write(page.content())
-    except Exception: pass
-
 # ========================== GOOGLE SHEETS ==========================
 import gspread
 from google.oauth2.service_account import Credentials
@@ -48,20 +34,23 @@ except gspread.exceptions.WorksheetNotFound:
     ws = sh.add_worksheet(title=SHEET_TAB, rows=2000, cols=10)
 
 # ========================== UTILS ==========================
+DEBUG_DIR = pathlib.Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
+
 def tz_now() -> datetime:
     return datetime.now(ZoneInfo("Europe/Madrid"))
 
-def day_target() -> datetime:
-    return tz_now() - timedelta(days=2)  # hoy-2
+def target_dt() -> datetime:
+    """La fecha que necesitamos: hoy-2 en Europa/Madrid."""
+    return tz_now() - timedelta(days=2)
 
-def dmy(d: datetime) -> str:       # dd/mm/aaaa
+def dmy(d: datetime) -> str:
     return d.strftime("%d/%m/%Y")
-def dmy_dash(d: datetime) -> str:  # dd-mm-aaaa
-    return d.strftime("%d-%m-%Y")
-def ymd(d: datetime) -> str:       # aaaa-mm-dd
+
+def ymd(d: datetime) -> str:
     return d.strftime("%Y-%m-%d")
 
 def gs_date_serial(d: date) -> int:
+    # Serial de Google Sheets (sistema 1899-12-30)
     return (d - date(1899, 12, 30)).days
 
 def norm(s: str) -> str:
@@ -102,6 +91,7 @@ def to_int(x):
     return int(s) if s.isdigit() else None
 
 def pick_table(tables):
+    # buscamos la tabla con señales típicas
     signals = [
         {"navegadoresunicos","usuariosunicos","usuarios","users","navegadores"},
         {"visitas","sesiones","sessions","visits"},
@@ -139,7 +129,20 @@ def shape_output(df: pd.DataFrame, media_col: str, forced_date: datetime) -> pd.
     out = out.sort_values("__ord").drop(columns="__ord")
     return out
 
-# ---------- escritura ----------
+def _to_serial_rows(rows):
+    out = []
+    for r in rows:
+        rr = list(r)
+        try:
+            dt = datetime.strptime(str(rr[0]), "%Y-%m-%d").date()
+            rr[0] = gs_date_serial(dt)
+        except: pass
+        for i in (2,3,4):
+            try: rr[i] = int(rr[i]) if rr[i] not in ("", None, "nan") else ""
+            except: pass
+        out.append(rr)
+    return out
+
 def _write_ws_with_formats(target_ws, values):
     target_ws.clear()
     target_ws.update("A1", values)
@@ -151,66 +154,47 @@ def _write_ws_with_formats(target_ws, values):
     except Exception as e:
         print(f"[FORMAT][WARN] {e}")
 
-def _read_or_init_df():
+def write_append_and_dedupe_types(df_new: pd.DataFrame):
+    header = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
     vals = ws.get_all_values()
     if not vals:
-        _write_ws_with_formats(ws, [HEADER])
-        return pd.DataFrame(columns=HEADER)
-    cols = vals[0]; data = vals[1:]
-    df = pd.DataFrame(data, columns=cols) if data else pd.DataFrame(columns=cols)
-    for c in HEADER:
-        if c not in df.columns: df[c] = ""
-    return df[HEADER]
+        data = df_new.astype(object).where(pd.notna(df_new), "").values.tolist()
+        _write_ws_with_formats(ws, [header] + _to_serial_rows(data)); return
 
-def write_append_and_dedupe_types(df_new: pd.DataFrame):
-    df_old = _read_or_init_df()
+    df_old = pd.DataFrame(vals[1:], columns=vals[0])
     for c in ("Navegadores Únicos","Visitas","Páginas Vistas"):
         if c in df_old.columns:
             df_old[c] = pd.to_numeric(
-                df_old[c].astype(str).str.replace(".","",regex=False).str.replace(",","",regex=False),
+                df_old[c].str.replace(".","",regex=False).str.replace(",","",regex=False),
                 errors="coerce"
             ).astype("Int64")
+
     combo = pd.concat([df_old, df_new], ignore_index=True)
     combo = combo.drop_duplicates(subset=["Fecha","Nombre"], keep="last")
+
     order_index = {TARGET_NAMES[k]: i for i,k in enumerate(ORDER_KEYS)}
     combo["__ord"] = combo["Nombre"].map(lambda x: order_index.get(x, 999))
     combo = combo.sort_values(["Fecha","__ord"]).drop(columns="__ord")
-    # serializar fechas y números
-    rows = []
-    for r in combo.astype(object).where(pd.notna(combo), "").values.tolist():
-        rr = list(r)
-        try:
-            dt = datetime.strptime(str(rr[0]), "%Y-%m-%d").date()
-            rr[0] = gs_date_serial(dt)
-        except: pass
-        for i in (2,3,4):
-            try: rr[i] = int(rr[i]) if rr[i] not in ("", None, "nan") else ""
-            except: pass
-        rows.append(rr)
-    _write_ws_with_formats(ws, [HEADER] + rows)
+    rows = combo.astype(object).where(pd.notna(combo), "").values.tolist()
+    _write_ws_with_formats(ws, [header] + _to_serial_rows(rows))
 
-def write_no_data(target_dt: datetime):
-    df_old = _read_or_init_df()
-    row = {"Fecha": ymd(target_dt), "Nombre": "NO HAY DATOS",
-           "Navegadores Únicos": "", "Visitas": "", "Páginas Vistas": ""}
-    mask = (df_old["Fecha"] == row["Fecha"]) & (df_old["Nombre"] == "NO HAY DATOS")
-    if mask.any():
-        print("[INFO] Aviso ya presente.")
-        return
-    df_new = pd.concat([df_old, pd.DataFrame([row])], ignore_index=True)
-    rows = []
-    for r in df_new.astype(object).where(pd.notna(df_new), "").values.tolist():
-        rr = list(r)
-        try:
-            dt = datetime.strptime(str(rr[0]), "%Y-%m-%d").date()
-            rr[0] = gs_date_serial(dt)
-        except: pass
-        rows.append(rr)
-    _write_ws_with_formats(ws, [HEADER] + rows)
+def write_no_data(target: datetime):
+    """Inserta 'NO HAY DATOS' para esa fecha (una sola fila) si no existía."""
+    target_ymd = ymd(target)
+    vals = ws.get_all_values()
+    header = ["Fecha","Nombre","Navegadores Únicos","Visitas","Páginas Vistas"]
+    row = [target_ymd, "NO HAY DATOS", "", "", ""]
+    if not vals:
+        _write_ws_with_formats(ws, [header, row]); return
+    df_old = pd.DataFrame(vals[1:], columns=vals[0]) if len(vals) > 1 else pd.DataFrame(columns=header)
+    mask = (df_old.get("Fecha","") == target_ymd) & (df_old.get("Nombre","") == "NO HAY DATOS")
+    if not mask.any():
+        ws.append_row(row, value_input_option="USER_ENTERED")
 
 # ========================== PLAYWRIGHT ==========================
 def login_tm(page):
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    # cookies (si aparecen)
     for txt in ["ACEPTAR TODO","Aceptar todo","Aceptar cookies","RECHAZAR","Rechazar todo"]:
         try:
             b = page.get_by_role("button", name=re.compile(txt, re.I))
@@ -220,123 +204,83 @@ def login_tm(page):
     page.get_by_placeholder("Contraseña").fill(OJD_PASS)
     page.get_by_role("button", name=re.compile(r"Acceder", re.I)).click()
     page.wait_for_load_state("networkidle")
-    save_debug(page, "01_after_login")
 
-def _find_day_input(page):
-    try:
-        lab = page.locator("label:has-text('Día')").first
-        if lab.count():
-            cand = lab.locator("xpath=following::input[1]").first
-            if cand.count(): return cand
-    except: pass
-    loc = page.locator("input[type='date']").first
-    if loc.count(): return loc
-    return page.locator("input:visible").first
-
-def _select_all_delete(inp):
-    try: inp.press("Control+A"); inp.press("Delete")
-    except: pass
-    try: inp.press("Meta+A"); inp.press("Backspace")
-    except: pass
-
-def _force_value_via_js(page, iso_ymd):
-    page.evaluate("""(iso) => {
-        const inp = document.querySelector('label:has-text("Día")~input, input[type="date"], input');
-        if (inp) {
-          inp.value = iso;
-          inp.dispatchEvent(new Event('input',{bubbles:true}));
-          inp.dispatchEvent(new Event('change',{bubbles:true}));
-          if (inp.blur) inp.blur();
-        }
-    }""", iso_ymd)
-
-def current_ui_date(page) -> str | None:
-    try:
-        banner = page.locator("text=Los datos de Día").first
-        if banner.count():
-            txt = banner.inner_text()
-            m = re.search(r"D[íi]a\s+(\d{1,2})\s+([A-Za-zÁÉÍÓÚñç]+)\s+(\d{4})", txt)
-            if m:
-                dd = int(m.group(1)); yy = int(m.group(3))
-                meses = {"enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
-                         "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,
-                         "noviembre":11,"diciembre":12}
-                mm = meses.get(m.group(2).lower())
-                if mm: return f"{dd:02d}/{mm:02d}/{yy}"
-    except: pass
-    try:
-        lab = page.locator("label:has-text('Día')").first
-        inp = lab.locator("xpath=following::input[1]").first if lab.count() else page.locator("input:visible").first
-        if inp.count():
-            val = inp.input_value().strip().replace("-", "/")
-            if re.fullmatch(r"\d{2}/\d{2}/\d{4}", val):
-                return val
-    except: pass
-    return None
-
-def set_date_and_search(page, dt: datetime, tag: str):
+def set_date_and_search(page, dt: datetime) -> bool:
+    """
+    Escribe la fecha en #datepicker (dd/mm/yyyy), verifica que quedó escrita
+    y pulsa el botón Buscar (icono lupa). Devuelve True si parece haber recargado.
+    """
     page.goto(TM_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    desired_ddmmyyyy = dmy(dt)
-    desired_iso      = ymd(dt)
 
-    for attempt in range(3):
-        inp = _find_day_input(page)
-        inp.click(); _select_all_delete(inp)
-        inp.fill(desired_ddmmyyyy)
-        inp.dispatch_event("input"); inp.dispatch_event("change"); inp.blur()
-        page.wait_for_timeout(150)
-        val = ""
-        try: val = inp.input_value().strip()
-        except: pass
-        if not val:
-            inp.click(); _select_all_delete(inp)
-            inp.fill(dmy_dash(dt))
-            inp.dispatch_event("input"); inp.dispatch_event("change"); inp.blur()
-            page.wait_for_timeout(150)
-            try: val = inp.input_value().strip()
-            except: val = ""
-        if not val:
-            _force_value_via_js(page, desired_iso)
-            page.wait_for_timeout(150)
+    wanted = dmy(dt)
+    inp = page.locator("#datepicker")
+    # Espera a que exista el input
+    inp.wait_for(state="visible", timeout=8000)
 
-        # Buscar
-        clicked = False
+    # Borrar y escribir (doble estrategia: fill + select_all+type)
+    try:
+        inp.fill("")              # limpia
+        inp.fill(wanted)          # escribe
+        # por si queda basura, reescribe seleccionando todo:
+        inp.press("Control+a")
+        inp.type(wanted, delay=20)
+    except PWTimeout:
+        return False
+
+    # Confirmar que quedó el valor correcto
+    ok = False
+    for _ in range(4):
         try:
-            btn = page.get_by_role("button", name=re.compile(r"\bBuscar\b", re.I))
-            if btn.count(): btn.first.click(); clicked = True
-        except: pass
-        if not clicked:
-            for sel in ["button:has-text('Buscar')",
-                        "input[type='submit'][value*='Buscar']",
-                        "button[title*='Buscar']"]:
-                loc = page.locator(sel).first
-                if loc.count(): loc.click(); clicked = True; break
-        if not clicked:
-            inp.press("Enter")
+            val = inp.input_value(timeout=2000)
+            if val.strip() == wanted:
+                ok = True
+                break
+            time.sleep(0.4)
+        except:
+            time.sleep(0.4)
+    if not ok:
+        print(f"[WARN] No se pudo fijar la fecha correcta. Quedó: '{inp.input_value()}'")
+        # aún así seguimos, por si la web respeta el valor enviado.
 
-        # Esperar a que haya filas en la tabla
-        try:
-            page.wait_for_selector("table tbody tr", timeout=12000)
-        except PWTimeout:
-            pass
+    # Pulsar Buscar (botón con icono lupa)
+    # selector robusto: botón submit o el que contenga .fa-search
+    clicked = False
+    for sel in [
+        "button[type='submit']",
+        "button:has(.fa-search)",
+        "form button.btn"
+    ]:
+        loc = page.locator(sel)
+        if loc.count():
+            loc.first.click()
+            clicked = True
+            break
+    if not clicked:
+        # último recurso: Enter en el input
+        inp.press("Enter")
 
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(600)
-        save_debug(page, f"{tag}_attempt{attempt+1}")
+    # Espera a que la tabla/all content se refresque
+    page.wait_for_load_state("networkidle")
+    time.sleep(1.0)  # margen
 
-        ui_date = current_ui_date(page)
-        if ui_date == desired_ddmmyyyy:
-            print(f"[OK] Fecha fijada: {ui_date}")
-            return
-        else:
-            print(f"[WARN] Intento {attempt+1}: UI={ui_date} != {desired_ddmmyyyy}")
+    return True
 
-    print("[ERROR] No se pudo fijar la fecha tras 3 intentos.")
+def table_fingerprint(page) -> str:
+    try:
+        tbl = page.locator("table").first
+        if not tbl.count(): return ""
+        html = tbl.inner_html()
+        return hashlib.md5(html.encode("utf-8", errors="ignore")).hexdigest()
+    except:
+        return ""
 
 def read_table(page) -> pd.DataFrame:
     html = page.content()
-    tables = pd.read_html(html)
+    try:
+        tables = pd.read_html(html)
+    except ValueError:
+        return pd.DataFrame()
     if not tables: return pd.DataFrame()
     t = pick_table(tables)
     return t if t is not None else pd.DataFrame()
@@ -344,35 +288,66 @@ def read_table(page) -> pd.DataFrame:
 # ========================== MAIN ==========================
 def run():
     print("[START] ojd_export.py")
-    target = day_target()
+    tgt = target_dt()
+    print(f"[INFO] Fecha objetivo (hoy-2): {ymd(tgt)}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
+        # 1) Login
         login_tm(page)
 
-        # Ir directamente a hoy-2, verificar fecha y que haya filas
-        set_date_and_search(page, target, "target")
+        # 2) Fijar fecha exacta en #datepicker y Buscar
+        ok = set_date_and_search(page, tgt)
+        if not ok:
+            print("[ERR] No fue posible preparar el filtro de fecha.")
+            write_no_data(tgt)
+            browser.close()
+            return
 
+        # 3) Verificar que la página está en la fecha deseada (valor del input)
+        try:
+            val_now = page.locator("#datepicker").input_value(timeout=4000)
+            print(f"[INFO] Datepicker ahora es: '{val_now}'")
+        except:
+            val_now = ""
+        if val_now.strip() != dmy(tgt):
+            print("[WARN] El datepicker no refleja hoy-2. Intento 2…")
+            # Un segundo intento rápido
+            set_date_and_search(page, tgt)
+            try:
+                val_now = page.locator("#datepicker").input_value(timeout=4000)
+            except:
+                val_now = ""
+            print(f"[INFO] Datepicker tras reintento: '{val_now}'")
+
+        # 4) Leer tabla
+        fp_before = table_fingerprint(page)
         df = read_table(page)
         if df.empty:
-            print("[INFO] Tabla vacía para hoy-2 -> NO HAY DATOS.")
-            write_no_data(target); browser.close(); print("[DONE]"); return
+            print("[INFO] No se pudo leer una tabla válida ⇒ NO HAY DATOS.")
+            write_no_data(tgt)
+            browser.close()
+            return
 
-        # Seleccionar la columna de “medio”
+        # 5) Determinar columna de medio
         candidates = [c for c in df.columns if norm(c) in {
             "nombre","medio","site","sitio","dominio","brand","marca","titulo","name"
         }]
         media_col = candidates[0] if candidates else df.columns[0]
 
-        out = shape_output(df, media_col, target)
+        out = shape_output(df, media_col, tgt)
         if out.empty:
-            print("[INFO] Tras filtro de medios, ninguna fila -> NO HAY DATOS.")
-            write_no_data(target); browser.close(); print("[DONE]"); return
+            print("[INFO] Tras filtro de medios, no hay filas ⇒ NO HAY DATOS.")
+            write_no_data(tgt)
+            browser.close()
+            return
 
+        # 6) Escribir en la base con formatos y dedupe
         write_append_and_dedupe_types(out)
+
         browser.close()
         print("[DONE] OK")
 
