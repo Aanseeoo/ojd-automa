@@ -66,25 +66,59 @@ def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", unidecode(str(s).lower()))
 
 TARGET_NAMES = {
-    "ultimahora":       "ULTIMAHORA.ES",
-    "diariodemallorca": "DIARIODEMALLORCA.ES",
-    "diariodeibiza":    "DIARIODEIBIZA.ES",
-    "mallorcamagazin":  "MALLORCAMAGAZIN.COM",
-    "mallorcazeitung":  "MALLORCAZEITUNG.COM",
-    "majorcadaily":     "MAJORCADAILYBULLETIN.COM",
-    "majorcadailybulletin": "MAJORCADAILYBULLETIN.COM",
+    "ultimahora":            "ULTIMAHORA.ES",
+    "diariodemallorca":      "DIARIODEMALLORCA.ES",
+    "diariodeibiza":         "DIARIODEIBIZA.ES",
+    "mallorcamagazin":       "MALLORCAMAGAZIN.COM",
+    "mallorcazeitung":       "MALLORCAZEITUNG.COM",
+    "majorcadaily":          "MAJORCADAILYBULLETIN.COM",
+    "majorcadailybulletin":  "MAJORCADAILYBULLETIN.COM",
+    "periodicodeibiza":      "PERIODICODEIBIZA.ES",
+    "lavozdeibiza":          "LAVOZDEIBIZA.COM",
 }
+
 ALIASES = {
-    "ultimahora": {"ultimahora.es","ultimahora","ultima hora","última hora"},
-    "diariodemallorca": {"diariodemallorca.es","diariodemallorca","diario de mallorca"},
-    "diariodeibiza": {"diariodeibiza.es","diariodeibiza","diario de ibiza"},
-    "mallorcamagazin": {"mallorcamagazin.es","mallorca magazin","mallorcamagazin.com"},
-    "mallorcazeitung": {"mallorcazeitung.es","mallorca zeitung","mallorcazeitung.com"},
-    "majorcadaily": {"majorcadailybulletin.es","majorcadaily","majorca daily bulletin",
-                     "majorca daily","majorcadailybulletin.com"},
+    "ultimahora": {
+        "ultimahora.es","ultimahora","ultima hora","última hora"
+    },
+    "diariodemallorca": {
+        "diariodemallorca.es","diariodemallorca","diario de mallorca"
+    },
+    "diariodeibiza": {
+        "diariodeibiza.es","diariodeibiza","diario de ibiza"
+    },
+    "mallorcamagazin": {
+        "mallorcamagazin.es","mallorca magazin","mallorcamagazin.com"
+    },
+    "mallorcazeitung": {
+        "mallorcazeitung.es","mallorca zeitung","mallorcazeitung.com"
+    },
+    "majorcadaily": {
+        "majorcadailybulletin.es","majorcadaily","majorca daily bulletin",
+        "majorca daily","majorcadailybulletin.com"
+    },
+    "majorcadailybulletin": {
+        "majorcadailybulletin.es","majorcadailybulletin.com","majorca daily bulletin"
+    },
+    "periodicodeibiza": {
+        "periodicodeibiza.es","periodico de ibiza","periódico de ibiza","periodicodeibiza"
+    },
+    "lavozdeibiza": {
+        "lavozdeibiza.com","la voz de ibiza","voz de ibiza","lavozdeibiza"
+    },
 }
-ORDER_KEYS = ["ultimahora","diariodemallorca","diariodeibiza",
-              "mallorcamagazin","mallorcazeitung","majorcadaily"]
+
+# Orden deseado (periodicodeibiza penúltimo, lavozdeibiza último)
+ORDER_KEYS = [
+    "ultimahora",
+    "diariodemallorca",
+    "diariodeibiza",
+    "mallorcamagazin",
+    "mallorcazeitung",
+    "majorcadaily",
+    "periodicodeibiza",  # penúltimo
+    "lavozdeibiza"       # último
+]
 
 def canonical_name(val: str) -> str | None:
     n = norm(val)
