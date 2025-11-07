@@ -5,7 +5,12 @@ on:
     # 12:15 hora España (dos crons por cambio CEST/CET)
     - cron: '15 10 * * *'  # 10:15 UTC -> 12:15 CEST
     - cron: '15 11 * * *'  # 11:15 UTC -> 12:15 CET
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_date_ddmmyyyy:
+        description: 'Fecha forzada (dd/mm/yyyy). Ej: 04/10/2025'
+        required: false
+        default: ''
 
 jobs:
   run:
@@ -20,6 +25,7 @@ jobs:
 
       - name: Install deps
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
@@ -28,11 +34,18 @@ jobs:
           mkdir -p debug
           echo "run $(date -u +%F_%T)Z" > debug/heartbeat.txt
 
+      # <<< NUEVO: aplicar fecha forzada si se proporciona en el "Run workflow" manual >>>
+      - name: Apply manual FORCE_DATE_DDMMYYYY if provided
+        run: |
+          echo "FORCE_DATE_DDMMYYYY=${{ github.event.inputs.force_date_ddmmyyyy }}" >> $GITHUB_ENV
+          echo "FORCE_DATE_DDMMYYYY='${{ github.event.inputs.force_date_ddmmyyyy }}'"
+
       - name: Run export
         env:
           OJD_USER: ${{ secrets.OJD_USER }}
           OJD_PASS: ${{ secrets.OJD_PASS }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # No hace falta pasar FORCE_DATE_DDMMYYYY aquí: ya está en $GITHUB_ENV
         run: python ojd_export.py
 
       - name: Upload debug snapshots
